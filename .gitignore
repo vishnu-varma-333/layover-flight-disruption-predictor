@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+*.log
+
+# Local infra volumes/state
+infra/.volumes/
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# OS
+.DS_Store
+
+# AI assistant artifacts — never committed to this repo
+CLAUDE.md
+AGENTS.md
+.claude/
+.cursor/
+.github/copilot-instructions.md

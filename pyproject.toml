@@ -1,0 +1,24 @@
+[project]
+name = "layover"
+version = "0.1.0"
+description = "Real-time flight disruption predictor"
+requires-python = ">=3.9"
+dependencies = [
+    "confluent-kafka==2.5.3",
+    "psycopg2-binary==2.9.9",
+    "redis==5.0.8",
+    "requests==2.32.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff==0.6.9",
+    "pytest==8.3.3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
