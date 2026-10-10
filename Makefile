@@ -1,10 +1,17 @@
-.PHONY: up down logs verify lint test fetch-data build-data verify-data train-model backtest live-ingest verify-live
+.PHONY: up down logs verify lint test fetch-data build-data verify-data train-model backtest live-ingest verify-live rotation-produce rotation-job rotation-verify
 
 # LightGBM's macOS wheel needs the libomp OpenMP runtime, which it expects
 # at a Homebrew path this project deliberately doesn't use. scikit-learn's
 # wheel already bundles a compatible libomp.dylib -- point the dynamic
 # linker at it instead of installing anything new. See DECISIONS.md.
 LIBOMP_DIR := $(shell .venv/bin/python -c "import sklearn, os; print(os.path.join(os.path.dirname(sklearn.__file__), '.dylibs'))")
+
+# PyFlink needs a real JVM (Java 17+) -- downloaded user-locally (Temurin,
+# no Homebrew) to ~/.local/jdk. Its Python UDF runner also spawns a `python`
+# subprocess, which needs .venv/bin on PATH (not just invoked directly) to
+# find it. See DECISIONS.md.
+JAVA_HOME := $(HOME)/.local/jdk/jdk-17.0.20.1+1/Contents/Home
+FLINK_PATH := $(PWD)/.venv/bin:$(PATH)
 
 up:
 	docker compose -f infra/docker-compose.yml up -d --wait --wait-timeout 180
@@ -44,3 +51,12 @@ live-ingest:
 
 verify-live:
 	.venv/bin/python scripts/verify_live_ingestion.py
+
+rotation-produce:
+	.venv/bin/python scripts/produce_flight_events.py
+
+rotation-job:
+	JAVA_HOME="$(JAVA_HOME)" PATH="$(FLINK_PATH)" .venv/bin/python -m layover_stream.rotation_job --bounded
+
+rotation-verify:
+	.venv/bin/python scripts/verify_rotation_job.py

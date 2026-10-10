@@ -15,7 +15,7 @@ planned).
       measure lead time and accuracy. First headline numbers.
 - [x] **5. Live ingestion** — OpenSky, weather and airport-status ingestors
       with credit budgeting.
-- [ ] **6. Stream processing** — Flink jobs for event-time handling,
+- [x] **6. Stream processing** — Flink jobs for event-time handling,
       rotation linking and feature updates.
 - [ ] **7. Prediction service** — FastAPI serving risk and explanations
       from online features.
@@ -486,3 +486,93 @@ with the measured 1-credit-per-call cost.
   extension once Milestones 8-9 introduce the Trip entity — a sequencing
   dependency, not a dropped requirement, exactly like Milestone 3's
   deferred live-weather features were resolved by this milestone.
+
+## Milestone 6 — Stream processing
+
+**Goal:** replace Milestone 4's Python, producer-sorted-order assumption
+with real Apache Flink stream processing — genuine event-time watermarks,
+Flink-managed keyed state, and explicit handling of late, out-of-order,
+duplicate and missing events, exactly as the spec names them.
+
+### What was built
+
+- A full PyFlink environment, installed entirely user-locally (no
+  Homebrew): Java 17 (Eclipse Temurin, direct download), `apache-flink`
+  2.2.1, and a separately-downloaded Kafka connector JAR matched to it —
+  with two real pip dependency conflicts (a missing `pkg_resources` during
+  `apache-beam`'s build, and a `pyarrow` version clash) diagnosed and
+  fixed at the root cause rather than worked around.
+- `src/layover_stream/rotation_state.py` — the pure, Flink-independent
+  rotation-linking logic (last-event-time-wins merge for out-of-order
+  "landed" events, the same feature computation as Milestones 3-4),
+  testable without a Flink runtime.
+- `src/layover_stream/rotation_job.py` — the real Flink job: a
+  `KeyedProcessFunction` keyed by tail number, with Flink `ValueState`/
+  `MapState` for rotation tracking, an explicit seen-keys dedup set, and
+  watermark-driven late-event detection routing to a side output.
+- `src/layover_stream/messy_events.py` — deliberately reorders,
+  duplicates, delays and drops events from Milestone 4's clean event
+  generator, independently controlling all four categories the spec names
+  verbatim ("late, out-of-order, duplicate and missing messages").
+- `scripts/produce_flight_events.py` / `verify_rotation_job.py` — produces
+  a real day's messy event stream plus a ground-truth reference (computed
+  by running the same pure logic on the *clean* stream in plain Python),
+  then compares the real Flink job's output against it.
+- 15 new unit tests (the pure rotation-state logic, the messiness
+  injector's four categories) plus a minimal isolated repro test that
+  diagnosed the watermark-propagation bug below.
+
+### Bugs found during live verification — five, all fixed, one substantial
+
+1. A `max(1, ...)` floor forced a "very late" event even when the rate
+   was explicitly 0 — caught by a unit test before touching live data.
+2. Ground truth and the real job initially compared different
+   `event_time` representations (pandas `Timestamp` vs. post-Kafka-JSON
+   float), which would have made every turnaround-time comparison look
+   like a mismatch regardless of whether the job was actually correct.
+3. `KafkaSource`/`KafkaSink` needs an actual `SimpleStringSchema()`
+   instance for (de)serialization, not a `Types.STRING()` type
+   descriptor — caught immediately on first run.
+4. PyFlink's Python API has no `ctx.output()` for side outputs (unlike
+   Java Flink) — a side output is a `yield (OutputTag, value)` tuple.
+5. **The substantial one**: binding a watermark strategy via
+   `from_source(source, watermark_strategy, ...)` silently fails to
+   propagate the assigned event-time to `ctx.timestamp()` for a Python
+   `KeyedProcessFunction` reading a `KafkaSource` — every event's
+   timestamp was reporting wall-clock "now" instead of its real July 2026
+   flight time, making the late-detection path dead code that looked
+   like it worked. Diagnosed with temporary instrumentation and a minimal
+   3-line isolated repro, not assumed; fixed by attaching the real
+   watermark strategy via an explicit `.assign_timestamps_and_watermarks()`
+   call on the stream instead of through `from_source`'s built-in binding.
+
+Full root-cause writeups for all five in DECISIONS.md.
+
+### Results (real data: 2026-07-15, 20,055 flights, 61,033 messy events)
+
+- **302 late events** correctly routed to a side output (the messy
+  stream displaced ~300 — confirms the mechanism isn't over- or
+  under-triggering).
+- **95.8% of flights present in both ground truth and Flink's output
+  match on every feature field.** The remaining 4.2% is the expected
+  consequence of deliberately dropped/very-late data genuinely being
+  unrecoverable information, not a bug — a system can't know what it was
+  never told and correctly discarded as too late to trust.
+- Full bounded run (real JVM, real connector, real Redpanda): **85
+  seconds**.
+
+### Progress notes
+
+- Lint and all 68 unit tests (53 from Milestones 1-5 + 15 new) pass clean.
+- PyFlink's live verification is a deliberate manual step
+  (`make rotation-produce && make rotation-job && make rotation-verify`),
+  not part of automated CI — the local JVM/connector setup is heavier
+  than this project's other CI jobs warrant provisioning fresh on every
+  push. CI still runs every offline unit test on every push.
+- Deferred nothing in this milestone's own scope. Full timer-based global
+  event-time reordering (Flink's most idiomatic, but substantially more
+  complex, answer to out-of-order per-key processing) was considered and
+  deliberately not built — documented as a real trade-off in DECISIONS.md,
+  not a shortcut that went unmentioned; the simpler watermark-plus-last-
+  write-wins design correctly handles every messiness category this
+  milestone actually tests, confirmed live.

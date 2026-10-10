@@ -885,3 +885,184 @@ through OpenSky's anonymous quota on an unpredictable schedule and make
 test runs depend on three external services' uptime — a deliberate scope
 boundary, not an oversight. CI still runs the offline, fixture-based unit
 tests for all the parsing and scheduling logic on every push.
+
+## Milestone 6 — Stream processing
+
+### PyFlink environment: a real, non-trivial, user-local install (no Homebrew)
+
+PyFlink needs a real JVM (Java 17+ for Flink 2.x — Java 11 support was
+dropped) and a separately-downloaded Kafka connector JAR (the DataStream
+API's Python bindings don't bundle one). All installed user-locally, no
+Homebrew, per standing project policy:
+
+- **Java**: Eclipse Temurin 17.0.20.1, downloaded directly from Adoptium's
+  GitHub releases (checksum-verified) to `~/.local/jdk` — not a system
+  install, not Homebrew's `openjdk` formula.
+- **PyFlink**: `apache-flink==2.2.1`, chosen (not the newest 2.3.0) because
+  Maven Central had a confirmed-matching Kafka connector build tagged
+  `-2.2` for it; 2.3.0 had no matching connector release yet at build
+  time. Checked directly on Maven Central rather than assumed.
+- **Kafka connector**: `flink-sql-connector-kafka-5.0.0-2.2.jar`,
+  downloaded directly from Maven Central to `~/.local/flink-connectors`
+  and loaded via `env.add_jars()` — this is the standard Flink pattern for
+  Python DataStream jobs that need a connector not on PyPI.
+
+### Dependency resolution: two real pip conflicts, fixed at the root cause
+
+**`pkg_resources` missing during `apache-beam`'s build** (a transitive
+dependency of `apache-flink`): pip's isolated build environment installs
+the latest `setuptools`, which no longer bundles `pkg_resources` by
+default, and `apache-beam`'s legacy `setup.py` imports it directly at
+build time with no explicit version constraint declared. Fixed by pinning
+`setuptools==75.6.0` (last version confirmed to still include it) in the
+project's own venv and installing with `--no-build-isolation`, so the
+build step reuses that pinned setuptools instead of fetching a fresh one.
+
+**`pyarrow` version conflict**: `apache-beam` 2.54-2.61 all require
+`pyarrow<17.0.0`, but this project had pinned exactly `pyarrow==17.0.0`
+since Milestone 2. Relaxed to `pyarrow==16.1.0` — satisfies every
+dependent package simultaneously (`mlflow<18`, `apache-flink<21`,
+`apache-beam<17`) — and confirmed the entire existing test suite (53
+tests spanning Milestones 1-5) still passes unchanged after the
+downgrade, since nothing in this project depends on anything pyarrow
+added between 16.1 and 17.0.
+
+### Event-time correctness via watermarks + last-write-wins, not full timer-based reordering
+
+A `KeyedProcessFunction.process_element` in Flink is invoked in *arrival*
+order per key, not event-time order — Flink's fully idiomatic answer to
+this (buffering each key's events in state and firing via registered
+event-time timers once the watermark passes) was considered and
+deliberately not built for v1: it's meaningfully more complex, and this
+job's actual correctness need is narrower than "process everything in
+strict global order." Instead:
+
+- **Late** events (event time more than `ALLOWED_LATENESS_SECONDS` behind
+  the current watermark) are routed to a side output via Flink's own
+  watermark mechanism — genuinely dropped from normal processing, not
+  silently absorbed.
+- **Ordinary out-of-order jitter** (within the bounded-out-of-orderness
+  window) is handled by a last-event-time-wins merge specifically on
+  `tail_state` updates (`merge_landed_event` in `rotation_state.py`): an
+  older "landed" event arriving after a newer one has already been
+  applied is a no-op, not a stale overwrite.
+- **Duplicates** are handled separately and explicitly via a seen-keys
+  `MapState` keyed by `(flight_id, event_type)` — dropped before they can
+  touch state at all, not relied on being naturally idempotent.
+
+Documented as a real trade-off, not hidden: this doesn't guarantee strict
+global event-time ordering the way timer-based buffering would, but it
+correctly handles every category of messiness this milestone actually
+tests (confirmed live — see results below), with substantially less
+implementation complexity.
+
+### Messiness injection: four independently-controlled categories, matching the spec's own words
+
+`layover_stream/messy_events.py` reuses Milestone 4's clean event
+generator as the source of truth for *what* events exist, and separately
+controls delivery order/completeness: **out-of-order** (small local
+shuffle windows — ordinary network/multi-partition jitter), **late**
+(a few events deliberately displaced to the very end of the produce
+sequence — guaranteed to exceed any reasonable watermark lateness bound),
+**duplicate** (exact re-sends a few positions later — an at-least-once
+producer retry), **missing** (dropped entirely, never sent). Matches the
+spec's own phrase verbatim ("late, out-of-order, duplicate and missing
+messages") rather than one blanket "shuffle everything" knob, so each
+category's handling can be verified independently.
+
+### Bugs found during live verification (five, all real, all fixed)
+
+**Bug 1 — `max(1, ...)` floor forced a "very late" event even at a 0%
+rate.** `inject_messiness`'s very-late count used
+`max(1, int(n * very_late_rate))` intending "at least one, if the rate is
+positive" but applying the floor unconditionally — a caller explicitly
+asking for zero late events still got one. Caught by a unit test
+(`test_zero_rates_preserves_order_and_content`) before it ever reached
+live data. Fixed by gating the floor on `very_late_rate > 0`.
+
+**Bug 2 — ground truth and the Flink job compared different `event_time`
+representations.** The reference implementation (`compute_ground_truth`)
+initially ran on the clean stream's own pandas `Timestamp` objects, while
+the real Flink job only ever sees JSON-serialized floats (Unix seconds)
+after a Kafka round-trip. `rotation_state.build_feature_update` guards
+`turnaround_minutes` with `isinstance(event_time, (int, float))` — so
+ground truth would have silently computed `None` for every single flight
+while Flink computed real values, making every comparison involving
+turnaround time look like a mismatch regardless of whether the job was
+actually correct. Fixed by converting to epoch seconds up front in
+`compute_ground_truth`, before any pure-function logic runs — the same
+representation the real job uses, by construction, not by coincidence.
+
+**Bug 3 — `KafkaSource`/`KafkaSink` serializer API misuse.**
+`set_value_only_deserializer(Types.STRING())` and
+`set_value_serialization_schema(Types.STRING())` both crashed with
+`AttributeError: 'BasicTypeInfo' object has no attribute
+'_j_deserialization_schema'` — these methods need an actual
+`DeserializationSchema`/`SerializationSchema` instance
+(`SimpleStringSchema()`), not a `TypeInformation` descriptor. An earlier,
+separate Kafka-connectivity smoke test (run before writing the real job)
+had already used `SimpleStringSchema()` correctly for the source side,
+which made this an inconsistency to catch, not a fresh unknown.
+
+**Bug 4 — PyFlink's Python API has no `ctx.output()` for side outputs.**
+The first real late event to reach that code path crashed with
+`AttributeError: 'InternalKeyedProcessFunctionContext' object has no
+attribute 'output'`. Unlike Java Flink, PyFlink's Python `ProcessFunction`
+API emits to a side output by yielding a `(OutputTag, value)` tuple from
+`process_element` itself, not via a context method — confirmed against
+Flink's own documented Python example before fixing, not guessed.
+
+**Bug 5 — the big one: binding a watermark strategy via
+`from_source(source, watermark_strategy, ...)` doesn't propagate the
+assigned event-time to `ctx.timestamp()` for a Python `KeyedProcessFunction`
+reading from a `KafkaSource`.** Diagnosed, not assumed: added temporary
+instrumentation printing `ctx.timestamp()` against the watermark on every
+call, and found every single processed event showed `ctx.timestamp()`
+equal to approximately *wall-clock "now"* (the moment the job was run) —
+not the July 2026 flight date actually encoded in each message's
+`event_time` field (independently confirmed correct by reading the raw
+Kafka messages directly). This made the watermark track "now minus the
+bounded-out-of-orderness," so no amount of event-time displacement in the
+*data* could ever look late relative to it — the late-detection path was
+silently dead code despite looking correct. Isolated with a minimal 3-line
+repro: a trivial `KeyedProcessFunction` printing `ctx.timestamp()` against
+a single known-old timestamp, fed via `env.from_collection(...)` +
+`.assign_timestamps_and_watermarks(...)` *called explicitly on the
+resulting stream* — which worked correctly, pointing squarely at
+`from_source`'s own built-in watermark-binding path for a `KafkaSource`
+specifically. Fixed by never relying on it: attach `WatermarkStrategy.no_watermarks()`
+inside `from_source()` and bind the real strategy via an explicit, separate
+`.assign_timestamps_and_watermarks()` call on the resulting stream instead.
+Confirmed fixed by the same diagnostic instrumentation, which then showed
+watermarks correctly spanning the real flight day and one event with a
+genuine 45-hour gap being correctly routed to the late side output.
+
+### Final live results (2026-07-15, 20,055 real flights, 61,033 messy events)
+
+- **302 late events** correctly routed to the side output (the messy
+  stream deliberately displaced ~300 events to trigger this — an almost
+  exact match, confirming the mechanism isn't over- or under-triggering).
+- **95.8% of flights present in both ground truth and Flink's output
+  match on every feature field** (18,922 of 19,746). The remaining 4.2%
+  is the expected, legitimate consequence of `missing_rate` and
+  `very_late_rate` genuinely discarding information this reference
+  implementation still has access to — not a correctness bug in the job.
+- 309 flights (1.5%) have no Flink output at all — consistent with
+  `missing_rate=0.01` occasionally dropping a flight's only recorded
+  event entirely.
+- End-to-end bounded run: **85 seconds** for 61,033 events through the
+  real JVM, connector, and Redpanda stack.
+
+### Not part of automated CI — same reasoning as Milestone 5's live ingestors
+
+PyFlink's setup (a downloaded JDK, a downloaded connector JAR, specific
+environment variables) is heavier than this project's other CI jobs and
+not something to provision fresh on every GitHub Actions run. Unlike
+Milestone 5's ingestors, this isn't about a shared external rate limit —
+it's that reproducing this exact local-tooling setup in CI would need its
+own dedicated provisioning step disproportionate to this milestone's
+goal. CI continues to run the offline, fixture-based unit tests for
+`messy_events.py` and `rotation_state.py` (15 tests) on every push; the
+live Flink+Kafka verification is a deliberate manual step
+(`make rotation-produce && make rotation-job && make rotation-verify`),
+documented in the README.
