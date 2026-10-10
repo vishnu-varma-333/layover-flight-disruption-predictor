@@ -105,7 +105,7 @@ def test_merge_landed_event_resets_across_day_boundary():
 
 
 def test_build_feature_update_no_inbound():
-    f = build_feature_update("f1", "N1", "2026-01-15", None, "schedule", 1000)
+    f = build_feature_update("f1", "N1", "2026-01-15", None, "schedule", 1000, 1000)
     assert f["has_inbound"] is False
     assert f["prev_arr_delay_min"] is None
     assert f["turnaround_minutes"] is None
@@ -118,7 +118,9 @@ def test_build_feature_update_with_inbound_computes_turnaround_and_tight_flag():
         "landed_at": 1000,
         "cum_delay_today": 15.0,
     }
-    f = build_feature_update("f2", "N1", "2026-01-15", inbound, "schedule", 1000 + 20 * 60)
+    f = build_feature_update(
+        "f2", "N1", "2026-01-15", inbound, "schedule", 1000, sched_dep_epoch=1000 + 20 * 60
+    )
     assert f["has_inbound"] is True
     assert f["prev_arr_delay_min"] == 15.0
     assert f["turnaround_minutes"] == 20.0
@@ -127,6 +129,23 @@ def test_build_feature_update_with_inbound_computes_turnaround_and_tight_flag():
 
 def test_build_feature_update_loose_turnaround_not_flagged_tight():
     inbound = {"arr_delay_min": 0.0, "dep_delay_min": 0.0, "landed_at": 0, "cum_delay_today": 0.0}
-    f = build_feature_update("f3", "N1", "2026-01-15", inbound, "schedule", 60 * 60)
+    f = build_feature_update(
+        "f3", "N1", "2026-01-15", inbound, "schedule", 0, sched_dep_epoch=60 * 60
+    )
     assert f["turnaround_minutes"] == 60.0
     assert f["tight_turnaround"] is False
+
+
+def test_build_feature_update_turnaround_ignores_event_time_not_sched_dep():
+    # The triggering event's own timestamp (`event_time`) must NOT affect
+    # turnaround_minutes -- only `sched_dep_epoch` (the flight's actual
+    # scheduled departure) should. A "schedule" event fires 24h before its
+    # own flight's departure; using its own event_time as the reference
+    # point (an earlier version of this function did) would be off by
+    # ~24h. See DECISIONS.md.
+    inbound = {"arr_delay_min": 0.0, "dep_delay_min": 0.0, "landed_at": 0, "cum_delay_today": 0.0}
+    for event_time in (0, 10**9, -500):
+        f = build_feature_update(
+            "f4", "N1", "2026-01-15", inbound, "schedule", event_time, sched_dep_epoch=1800
+        )
+        assert f["turnaround_minutes"] == 30.0

@@ -75,6 +75,19 @@ FEATURE_FIELDS = [
     "turnaround_minutes",
     "tight_turnaround",
     "cum_delay_today",
+    # Added for Milestone 7: the online job originally only emitted the
+    # rotation-state subset above; these are the rest of the real training
+    # schema (layover_model.features.SCHEDULE_FEATURES plus leg_index/
+    # chain_break from ROTATION_FEATURES) that a prediction service
+    # actually needs to score a flight -- see DECISIONS.md.
+    "leg_index",
+    "chain_break",
+    "carrier",
+    "origin",
+    "dest",
+    "month",
+    "day_of_week",
+    "dep_hour_local",
 ]
 
 

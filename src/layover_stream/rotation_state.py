@@ -22,15 +22,38 @@ TIGHT_TURNAROUND_MINUTES = 45
 
 
 def build_feature_update(
-    flight_id: str, tail_number: str, fl_date, inbound, source_event_type: str, event_time
+    flight_id: str,
+    tail_number: str,
+    fl_date,
+    inbound,
+    source_event_type: str,
+    event_time,
+    sched_dep_epoch=None,
 ) -> dict:
+    """`event_time` is when *this update* became known (the triggering
+    event's own timestamp) -- it belongs on the record for bookkeeping,
+    but it is NOT the right reference point for `turnaround_minutes`.
+
+    Found during Milestone 7's research pass: an earlier version of this
+    function measured turnaround from `event_time` (the triggering
+    event's own timestamp), which is only correct by coincidence -- a
+    "schedule" event fires 24h before its own flight's departure, so
+    measuring turnaround from it is off by ~24h; a "departed"/"landed"
+    update is off by this flight's own delay/flight-duration. Training's
+    actual definition (`layover_model.features`) is always
+    `sched_dep_utc - prev_actual_arr_utc`, regardless of which event
+    triggered the recompute -- so this function needs the flight's own
+    scheduled departure, not whatever moment happens to be recomputing
+    it. Masked until now because Milestone 6's own ground truth was
+    computed with this same (wrong) reference point -- see DECISIONS.md.
+    """
     turnaround_minutes = None
-    if inbound is not None and inbound.get("landed_at") is not None:
-        turnaround_minutes = (
-            (event_time - inbound["landed_at"]) / 60
-            if isinstance(event_time, (int, float))
-            else None
-        )
+    if (
+        inbound is not None
+        and inbound.get("landed_at") is not None
+        and isinstance(sched_dep_epoch, (int, float))
+    ):
+        turnaround_minutes = (sched_dep_epoch - inbound["landed_at"]) / 60
 
     return {
         "flight_id": flight_id,

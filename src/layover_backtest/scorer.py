@@ -100,10 +100,25 @@ class BacktestScorer:
     def _feature_dict(self, flight, inbound) -> dict:
         """Plain Python dict of raw feature values -- no pandas object
         construction here; see the module docstring for why.
+
+        `flight["leg_index"]` -- NOT `self.leg_index` -- is this flight's
+        leg index. Found during Milestone 7's research pass: this used to
+        re-read `self.leg_index.get(key, 0)` here, the *live* counter,
+        instead of the value `handle_event` already froze onto `flight`
+        at schedule time. Since the live counter keeps advancing as this
+        tail's *other* legs get scheduled later the same day, every
+        departed/landed-triggered re-score (and even the schedule-time
+        call itself, which runs after the counter's already been bumped
+        for the next leg) read a larger, wrong value -- a real feature
+        bug that's been live since Milestone 4, invisible in the
+        headline recall/lead-time/MAE numbers because leg_index is a
+        weak, mostly-redundant auxiliary signal (has_inbound/
+        prev_arr_delay_min/turnaround_minutes already carry the real
+        rotation signal), not something that showed up until an exact
+        field-level comparison against ground truth in Milestone 7. See
+        DECISIONS.md.
         """
         dep_hour, dow, month = self._local_time_parts(flight["origin"], flight["sched_dep_utc"])
-        key = (flight["tail_number"], flight["fl_date"])
-        idx = self.leg_index.get(key, 0)
 
         turnaround_minutes = None
         if inbound is not None and inbound.get("landed_at") is not None:
@@ -118,7 +133,7 @@ class BacktestScorer:
             "month": month,
             "day_of_week": dow,
             "dep_hour_local": dep_hour,
-            "leg_index": idx,
+            "leg_index": flight["leg_index"],
             "has_inbound": inbound is not None,
             "prev_arr_delay_min": inbound["arr_delay_min"] if inbound else None,
             "prev_dep_delay_min": inbound["dep_delay_min"] if inbound else None,

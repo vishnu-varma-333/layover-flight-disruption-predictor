@@ -21,12 +21,9 @@ from confluent_kafka.admin import AdminClient, NewTopic
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from layover_backtest.events import build_event_stream  # noqa: E402
+from layover_backtest.scorer import BacktestScorer  # noqa: E402
+from layover_data.airports import build_airport_tz_map  # noqa: E402
 from layover_stream.messy_events import inject_messiness  # noqa: E402
-from layover_stream.rotation_state import (  # noqa: E402
-    build_feature_update,
-    merge_landed_event,
-    resolve_inbound,
-)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -38,59 +35,33 @@ BOOTSTRAP_SERVERS = "localhost:19092"
 TOPIC = "stream.flight_events"
 
 
-def compute_ground_truth(clean_stream: pd.DataFrame) -> dict:
-    """Reference implementation: process the clean, sorted stream in
-    plain Python through the exact same pure functions the Flink job
-    uses, keeping only each flight's LAST feature update -- what a
-    correct system should converge to regardless of delivery order.
+def compute_ground_truth(clean_stream: pd.DataFrame, airport_tz_map: dict) -> dict:
+    """Reference implementation: drive the same `BacktestScorer` Milestone
+    4 already validated against a real month of historical data (it
+    reproduces the exact Milestone 3 training feature schema -- schedule
+    features included) over the clean, sorted stream, keeping only each
+    flight's LAST feature update -- what a correct system should converge
+    to regardless of delivery order.
 
-    event_time is converted to epoch seconds (float) up front, matching
-    exactly what the Flink job sees after a JSON round-trip over Kafka --
-    otherwise this reference would compare pandas Timestamps while Flink
-    compares floats, and turnaround_minutes (which only computes when
-    event_time is numeric) would silently never match.
+    Milestone 6 originally computed ground truth with a narrower, ad hoc
+    reimplementation (`rotation_state.build_feature_update` alone, called
+    directly from this function). That's why its "95.8% match" result
+    never caught that the real Flink job was silently missing
+    `leg_index`, `chain_break` and every schedule feature the models are
+    actually trained on: that reference only ever checked the fields it
+    itself computed. Found during Milestone 7's research pass (serving
+    predictions from these features is what exposed the gap) -- fixed by
+    reusing BacktestScorer here, so the ground truth is the same
+    already-proven feature logic the trained models expect, not a second,
+    independently-written approximation of it. See DECISIONS.md.
     """
-    tail_state = {}
-    pending = {}
+    scorer = BacktestScorer(airport_tz_map=airport_tz_map)
     ground_truth = {}
-
-    rows = clean_stream.to_dict("records")
-    for event in rows:
-        event["event_time"] = event["event_time"].timestamp()
-
-    for event in rows:
-        tail = event["tail_number"]
-        fl_date = event["fl_date"]
-        etype = event["event_type"]
-
-        if etype == "schedule":
-            inbound = resolve_inbound(tail_state.get(tail), fl_date)
-            ground_truth[event["flight_id"]] = build_feature_update(
-                event["flight_id"], tail, fl_date, inbound, "schedule", event["event_time"]
-            )
-            pending[event["flight_id"]] = event
-
-        elif etype == "departed":
-            if event["flight_id"] not in pending:
-                continue
-            pending.pop(event["flight_id"])
-            inbound = resolve_inbound(tail_state.get(tail), fl_date)
-            features = build_feature_update(
-                event["flight_id"], tail, fl_date, inbound, "departed", event["event_time"]
-            )
-            features["dep_delay_min"] = event["dep_delay_min"]
-            ground_truth[event["flight_id"]] = features
-
-        elif etype == "landed":
-            tail_state[tail] = merge_landed_event(tail_state.get(tail), event)
-            for fid, p in pending.items():
-                if p["tail_number"] != tail or p["fl_date"] != fl_date:
-                    continue
-                inbound = resolve_inbound(tail_state[tail], fl_date)
-                ground_truth[fid] = build_feature_update(
-                    fid, tail, fl_date, inbound, "landed", event["event_time"]
-                )
-
+    for event in clean_stream.to_dict("records"):
+        for request in scorer.handle_event(event):
+            if request["model"] == "schedule_only":
+                continue  # identical feature values to the "rotation" request for this event
+            ground_truth[request["flight_id"]] = request
     return ground_truth
 
 
@@ -126,7 +97,8 @@ def main():
     clean_stream = build_event_stream(day)
     logger.info("built %d clean events", len(clean_stream))
 
-    ground_truth = compute_ground_truth(clean_stream)
+    airport_tz_map = build_airport_tz_map(REPO_ROOT / "data" / "raw" / "reference" / "airports.csv")
+    ground_truth = compute_ground_truth(clean_stream, airport_tz_map)
     gt_path = PROCESSED_DIR / "rotation_ground_truth.json"
     gt_path.write_text(json.dumps(ground_truth, default=str))
     logger.info("wrote ground truth for %d flights to %s", len(ground_truth), gt_path)

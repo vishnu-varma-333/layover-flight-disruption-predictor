@@ -237,34 +237,42 @@ Milestone 3 (loaded from MLflow). Same machine as all prior benchmarks.
 
 ### Headline numbers (real replay, July 2026, 631,970 flights)
 
+**Re-measured 2026-10-10** after a Milestone 7 fix to a real bug in
+`BacktestScorer._feature_dict` (it re-read the *live* `leg_index` counter
+instead of the value frozen at schedule time — see DECISIONS.md). The
+numbers below are the corrected, current ones; they moved modestly from
+the original run (recall 66.0% -> 64.9%, median lead time 232 -> 219 min)
+— consistent with `leg_index` being a weak secondary signal rather than
+the rotation model's main driver, not a methodology change.
+
 | Metric | Rotation model | Schedule-only model |
 | --- | --- | --- |
-| Detection recall (15+ min delay, overall) | 66.0% (114,500/173,461) | 11.0% (18,994/173,461) |
-| Median lead time, detected only | 232.0 min | 1,440.0 min (simulation artifact — see DECISIONS.md) |
-| Mean lead time, detected only | 623.3 min | 1,440.0 min |
-| Recall, flights with any inbound aircraft (leg_index > 0) | **74.9%** (n=151,202) | — |
-| Recall, first leg of the day (leg_index == 0, no rotation signal possible) | 5.9% (n=22,259) | — |
+| Detection recall (15+ min delay, overall) | 64.9% (112,615/173,461) | 11.0% (18,994/173,461) |
+| Median lead time, detected only | 219.0 min | 1,440.0 min (simulation artifact — see DECISIONS.md) |
+| Mean lead time, detected only | 538.0 min | 1,440.0 min |
+| Recall, later legs (rotation signal available) | **73.9%** (n=151,202) | — |
+| Recall, first leg of the day (no rotation signal possible) | 3.9% (n=22,259) | — |
 
 ### MAE cross-check: this replay vs. Milestone 3's offline evaluation
 
 | Model | Milestone 3 (offline, sklearn-style) | Milestone 4 (this replay, event-driven) |
 | --- | --- | --- |
 | Schedule-only | 29.82 | 29.82 (exact match) |
-| Rotation (arrival, pre-departure) | 21.41 | 22.09 |
-| Post-departure | 10.12 | 10.14 |
+| Rotation (arrival, pre-departure) | 21.41 | 22.07 |
+| Post-departure | 10.12 | 10.12 (exact match) |
 
 All three evaluated on identical n=612,038 (non-cancelled, non-diverted,
 known-outcome flights in July 2026) in both methodologies. The exact
-match for schedule-only and near-exact match for post-departure validate
-that the replay harness correctly reproduces Milestone 3's model
-behavior end to end (Kafka transport, event parsing, categorical
-encoding, model loading — all independently exercised here). The small
-rotation-model gap (22.09 vs. 21.41) is expected, not a bug: this replay
-enforces point-in-time correctness strictly (a flight only sees its
-inbound leg's outcome if that leg has *actually landed* by the time of
-scoring), while Milestone 3's batch feature table always uses the
-eventual actual outcome regardless of whether it would genuinely be known
-yet — a small, rare look-ahead this replay deliberately does not have.
+match for schedule-only and post-departure validate that the replay
+harness correctly reproduces Milestone 3's model behavior end to end
+(Kafka transport, event parsing, categorical encoding, model loading —
+all independently exercised here). The small rotation-model gap (22.07
+vs. 21.41) is expected, not a bug: this replay enforces point-in-time
+correctness strictly (a flight only sees its inbound leg's outcome if
+that leg has *actually landed* by the time of scoring), while Milestone
+3's batch feature table always uses the eventual actual outcome
+regardless of whether it would genuinely be known yet — a small, rare
+look-ahead this replay deliberately does not have.
 
 ## Milestone 5 — Live ingestion
 
@@ -346,12 +354,18 @@ clean runs (confirming determinism, not a one-off).
 
 ### Correctness: Flink job output vs. ground truth
 
-**Setup:** ground truth computed by running the identical pure
-`rotation_state` logic on the *clean*, sorted stream in plain Python (no
-Flink); compared against the real Flink job's actual output after
-consuming the deliberately messy stream, on every feature field
-(`has_inbound`, `prev_arr_delay_min`, `prev_dep_delay_min`,
-`turnaround_minutes`, `tight_turnaround`, `cum_delay_today`).
+**Re-measured 2026-10-10** (Milestone 7): ground truth is now computed by
+running `layover_backtest.scorer.BacktestScorer` (Milestone 4's
+already-validated reference, which reproduces the real training feature
+schema) over the clean, sorted stream, rather than Milestone 6's original
+narrower reimplementation. Compared against the real Flink job's actual
+output on the complete 14-field training schema — the original 6
+rotation-state fields plus `leg_index`, `chain_break`, and every schedule
+feature (`carrier`, `origin`, `dest`, `month`, `day_of_week`,
+`dep_hour_local`). This substitution, plus two real bugs it surfaced
+(`turnaround_minutes` measured from the wrong timestamp; the Flink job
+originally missing 8 of these 14 fields entirely), are written up in
+DECISIONS.md.
 
 **Result:**
 
@@ -360,12 +374,21 @@ consuming the deliberately messy stream, on every feature field
 | Ground truth flights | 20,055 |
 | Flink feature updates received | 77,380 (across 19,746 distinct flights) |
 | Flights with no Flink output at all | 309 (1.5%) |
-| Flights present in both, matching on every field | 18,922 / 19,746 (**95.8%**) |
-| Flights present in both, mismatched | 824 (4.2%) |
+| Flights present in both, matching on every one of the 14 fields | 18,304 / 19,746 (**92.7%**) |
+| Flights present in both, mismatched | 1,442 (7.3%) |
 
-The 4.2% mismatch rate is not attributed to a bug: it's the expected,
-bounded consequence of `missing_rate` and `very_late_rate` genuinely
-discarding information the ground-truth reference still has access to —
-confirmed by the mismatch count being the same order of magnitude as
-`missing_rate + very_late_rate` applied to ~20K flights' worth of
-upstream dependencies, not an open-ended or unbounded error rate.
+A lower headline number than the original 95.8%, but a more trustworthy
+one — the old number checked 6 fields with a self-consistently-wrong
+reference; this one checks all 14 against an independently-validated
+one. Per-field mismatch breakdown confirms the remaining 7.3% is exactly
+where it's expected to be: the schedule-side fields (carrier/origin/dest/
+month/day_of_week/dep_hour_local) match **100%** (they don't depend on
+delivery order at all), while every rotation-dependent field sits at
+1.1%-4.6% mismatch — the same order of magnitude as `missing_rate +
+very_late_rate` applied to ~20K flights' worth of upstream dependencies,
+not an open-ended or unbounded error rate. `leg_index` sits at 3.0%,
+consistent with the ordinary "out-of-order" shuffle category
+occasionally reordering two of the same tail's schedule events relative
+to each other (unlike the other rotation fields, `leg_index`'s true
+value is inherently order-of-schedule-arrival dependent, so this residual
+is expected, not a bug).

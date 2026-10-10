@@ -1066,3 +1066,111 @@ goal. CI continues to run the offline, fixture-based unit tests for
 live Flink+Kafka verification is a deliberate manual step
 (`make rotation-produce && make rotation-job && make rotation-verify`),
 documented in the README.
+
+## Milestone 7 — Prediction service
+
+### Research pass before writing the service: tracing the feature schema end to end
+
+Per the standing instruction to research feature-engineering-adjacent work
+properly before implementing, the first step wasn't writing the FastAPI
+app -- it was tracing, field by field, whether `stream.flight_features`
+(Milestone 6's Flink output) actually carries everything
+`layover_model.features.SCHEDULE_FEATURES` + `ROTATION_FEATURES` (what
+the Milestone 3 models were trained on) requires. It didn't: the Flink
+job only ever emitted the narrow rotation-state subset
+`rotation_state.build_feature_update` computes
+(`has_inbound`/`prev_arr_delay_min`/`prev_dep_delay_min`/
+`turnaround_minutes`/`tight_turnaround`/`cum_delay_today`), missing
+`leg_index`, `chain_break`, and every schedule feature (carrier, origin,
+dest, month, day_of_week, dep_hour_local) entirely. A prediction service
+can't serve a model from features it was never given, so this had to be
+fixed before anything else in this milestone could be built on solid
+ground.
+
+That tracing exercise led to re-deriving Milestone 6's ground truth from
+`layover_backtest.scorer.BacktestScorer` (the Milestone 4 reference
+implementation that already reproduces training's exact feature schema)
+instead of Milestone 6's own narrower, ad hoc reimplementation --
+reasoning that re-using an independently-validated reference is stronger
+evidence than extending the same function that's also under test. That
+substitution is what actually surfaced the three real bugs below: the
+old ground truth was *self-consistently* comparing the Flink job against
+its own (also wrong, in one case) assumptions, which is exactly how a
+mismatch this size went unnoticed through Milestone 6's "95.8% match."
+
+### Three real bugs found by that substitution, none visible from the headline metrics alone
+
+1. **Missing fields (the gap above).** Fixed by having `rotation_job.py`
+   assemble the complete feature record itself (`_full_feature_update`):
+   `leg_index`/`chain_break` threaded through from the already-tracked
+   per-leg state, and the schedule-side fields computed from the raw
+   event's own carrier/origin/dest/sched_dep_utc plus the same
+   `airport_tz_map`-based local-time derivation every other script
+   already uses (loaded once in `open()`, not per event).
+
+2. **`turnaround_minutes` measured from the wrong timestamp.**
+   `rotation_state.build_feature_update` measured turnaround from the
+   *triggering event's own* `event_time`, not the flight's scheduled
+   departure. That's only correct by accident: a "schedule" event fires
+   24h before its own flight's departure, so turnaround measured from it
+   was off by ~24h; a "departed"/"landed" recompute was off by this
+   flight's own delay or flight duration. Training's real definition
+   (`layover_model.features.rotation_features`) is always
+   `sched_dep_utc - prev_actual_arr_utc`, independent of which event
+   triggers the recompute. Fixed by giving `build_feature_update` an
+   explicit `sched_dep_epoch` parameter instead of overloading
+   `event_time` for two different purposes. Masked in Milestone 6
+   because its ground truth used the same (wrong) reference point --
+   caught only once BacktestScorer's *correct* definition was used as
+   the comparison target.
+
+3. **`BacktestScorer._feature_dict` re-read the live `leg_index` counter
+   instead of the frozen value `handle_event` already attached to the
+   flight.** Since that counter keeps advancing as a tail's *other* legs
+   get their own schedule events later the same day, every
+   departed/landed-triggered re-score (and even the schedule-time call
+   itself, which runs after the counter's already bumped for next time)
+   read a larger, wrong value. This is a Milestone 4 bug, not a
+   Milestone 6 or 7 one -- it's been live since the real backtest that
+   produced this project's first headline recall/lead-time numbers, and
+   stayed invisible because `leg_index` is a weak, mostly-redundant
+   auxiliary signal (`has_inbound`, `prev_arr_delay_min`,
+   `turnaround_minutes` already carry the real rotation signal), not
+   something that shows up in aggregate MAE/recall unless checked field
+   by field. Fixed by reading `flight["leg_index"]` directly. A
+   regression test (`test_leg_index_stays_frozen_at_schedule_time_through_later_legs`)
+   locks the frozen-value semantics in.
+
+A fourth, purely operational bug surfaced during re-verification: neither
+`rotation_job.py` nor `produce_flight_events.py` ever reset the *output*
+topics (`stream.flight_features`, `stream.late_events`) between runs, so
+repeated verification runs kept accumulating messages in them --
+inflating counts and occasionally resolving "last update per flight" to
+a stale prior run. Fixed by having the bounded (verification) path
+delete and recreate both output topics at job start, the same way
+`produce_flight_events.py` already resets the input topic.
+
+### Milestone 4 and 6 numbers, re-measured after the fixes
+
+The leg_index bug fed the already-trained models a subtly wrong value at
+serving time throughout Milestone 4's real backtest. Re-running it after
+the fix (same real July 2026 month, 631,970 flights, identical trained
+models) changed the headline numbers modestly, not dramatically --
+consistent with leg_index being a weak secondary signal, not the
+rotation model's main driver:
+
+| Metric | Before fix | After fix |
+| --- | --- | --- |
+| Detection recall, overall | 66.0% | 64.9% |
+| Median lead time, detected only | 232.0 min | 219.0 min |
+| Recall, later legs (rotation signal available) | 74.9% | 73.9% |
+| Recall, first leg of day (no rotation signal possible) | 5.9% | 3.9% |
+| MAE, rotation model | 22.09 min | 22.07 min |
+
+`docs/BENCHMARKS.md` and `docs/MILESTONES.md` are updated to the
+after-fix numbers, with this entry as the record of why they changed.
+Milestone 6's own correctness check, re-run with the complete 14-field
+schema (not just the original 6) and the fixes above, moved from 95.8%
+match on a narrower, partly-wrong comparison to **92.7% match on the
+full, correct schema** -- a lower headline number than before, but a
+more trustworthy one, and the right one to build Milestone 7 on.

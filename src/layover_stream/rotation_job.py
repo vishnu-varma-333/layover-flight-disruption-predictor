@@ -22,7 +22,10 @@ not ad hoc timestamp comparisons:
 
 import json
 import sys
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
+import pandas as pd
 from pyflink.common import Duration, SimpleStringSchema, Types, WatermarkStrategy
 from pyflink.common.watermark_strategy import TimestampAssigner
 from pyflink.datastream import (
@@ -40,7 +43,12 @@ from pyflink.datastream.functions import RuntimeContext
 from pyflink.datastream.output_tag import OutputTag
 from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
 
+from layover_data.airports import build_airport_tz_map
 from layover_stream.rotation_state import build_feature_update, merge_landed_event, resolve_inbound
+
+AIRPORTS_CSV = (
+    Path(__file__).resolve().parent.parent.parent / "data" / "raw" / "reference" / "airports.csv"
+)
 
 CONNECTOR_JAR = (
     "file:///Users/chanakya/.local/flink-connectors/flink-sql-connector-kafka-5.0.0-2.2.jar"
@@ -79,6 +87,71 @@ class RotationLinkFunction(KeyedProcessFunction):
         self.seen_keys = runtime_context.get_map_state(
             MapStateDescriptor("seen_keys", Types.STRING(), Types.BOOLEAN())
         )
+        # Loaded once per task, not per event -- same pattern as every other
+        # script that needs this lookup (train_model.py, run_backtest.py).
+        self.airport_tz_map = build_airport_tz_map(AIRPORTS_CSV)
+
+    def _full_feature_update(
+        self, flight: dict, leg_index: int, inbound, source_event_type, event_time
+    ):
+        """Builds the complete feature record the models were trained on
+        (layover_model.features.SCHEDULE_FEATURES + ROTATION_FEATURES):
+        the pure rotation-state fields from `build_feature_update`, plus
+        `leg_index`/`chain_break` and the schedule-side context
+        (carrier/origin/dest/month/day_of_week/dep_hour_local) that
+        function deliberately doesn't compute.
+
+        `sched_dep_utc` only survives the Kafka wire as a string (JSON has
+        no timestamp type) -- parsed back into a tz-aware Timestamp once
+        here and reused for both the local-time parts and (as epoch
+        seconds) `turnaround_minutes`, so there's exactly one parse and
+        one source of truth for "this flight's scheduled departure"
+        rather than two call sites quietly assuming the same value.
+
+        Found during Milestone 7's research pass, two real gaps, both
+        fixed here (see DECISIONS.md for the full writeup):
+        1. This job's feature output originally carried only the
+           rotation-state subset (verify_rotation_job.py's own old
+           FEATURE_FIELDS list) -- silently missing every field below.
+        2. `build_feature_update` used to measure `turnaround_minutes`
+           from the *triggering event's own* `event_time`, not the
+           flight's scheduled departure -- correct only for a
+           coincidence of units, wrong by ~24h at schedule time and by
+           this flight's own delay/duration at departed/landed time.
+           Training's actual definition is always
+           `sched_dep_utc - prev_actual_arr_utc`, independent of which
+           event is doing the recomputing.
+        """
+        raw_sched_dep = flight.get("sched_dep_utc")
+        sched_dep_ts = pd.Timestamp(raw_sched_dep) if raw_sched_dep else None
+        sched_dep_epoch = sched_dep_ts.timestamp() if sched_dep_ts is not None else None
+
+        features = build_feature_update(
+            flight["flight_id"],
+            flight["tail_number"],
+            flight["fl_date"],
+            inbound,
+            source_event_type,
+            event_time,
+            sched_dep_epoch=sched_dep_epoch,
+        )
+
+        tz = self.airport_tz_map.get(flight["origin"])
+        if tz is not None and sched_dep_ts is not None:
+            local = sched_dep_ts.to_pydatetime().astimezone(ZoneInfo(tz))
+            dep_hour, dow, month = local.hour, local.weekday(), local.month
+        else:
+            dep_hour, dow, month = None, None, None
+
+        features["leg_index"] = leg_index
+        features["chain_break"] = (inbound["dest"] != flight["origin"]) if inbound else False
+        features["carrier"] = flight["carrier"]
+        features["origin"] = flight["origin"]
+        features["dest"] = flight["dest"]
+        features["dep_hour_local"] = dep_hour
+        features["day_of_week"] = dow
+        features["month"] = month
+        return features
 
     def process_element(self, value, ctx: "KeyedProcessFunction.Context"):
         watermark = ctx.timer_service().current_watermark()
@@ -113,9 +186,7 @@ class RotationLinkFunction(KeyedProcessFunction):
             self.leg_index.put(leg_key, idx + 1)
 
             inbound = resolve_inbound(current_tail_state, fl_date)
-            features = build_feature_update(
-                event["flight_id"], tail, fl_date, inbound, "schedule", event_time
-            )
+            features = self._full_feature_update(event, idx, inbound, "schedule", event_time)
             yield json.dumps(features)
 
             self.pending.put(event["flight_id"], json.dumps({**event, "leg_index": idx}))
@@ -125,9 +196,10 @@ class RotationLinkFunction(KeyedProcessFunction):
             if pending_json is None:
                 return
             self.pending.remove(event["flight_id"])
+            pending_entry = json.loads(pending_json)
             inbound = resolve_inbound(current_tail_state, fl_date)
-            features = build_feature_update(
-                event["flight_id"], tail, fl_date, inbound, "departed", event_time
+            features = self._full_feature_update(
+                pending_entry, pending_entry["leg_index"], inbound, "departed", event_time
             )
             features["dep_delay_min"] = event["dep_delay_min"]
             yield json.dumps(features)
@@ -144,8 +216,8 @@ class RotationLinkFunction(KeyedProcessFunction):
                 if pending_entry["fl_date"] != fl_date:
                     continue
                 inbound = resolve_inbound(new_tail_state, fl_date)
-                features = build_feature_update(
-                    flight_id, tail, fl_date, inbound, "landed", event_time
+                features = self._full_feature_update(
+                    pending_entry, pending_entry["leg_index"], inbound, "landed", event_time
                 )
                 yield json.dumps(features)
 
@@ -205,8 +277,37 @@ def build_job(env: StreamExecutionEnvironment, bounded: bool = False):
     return env
 
 
+def _reset_output_topics():
+    """Bounded (verification) runs only: delete and recreate the output
+    topics before running, the same way produce_flight_events.py resets
+    the input topic.
+
+    Found live, during Milestone 7: neither this job nor
+    produce_flight_events.py ever reset `stream.flight_features` /
+    `stream.late_events`, so every repeated verification run's output
+    kept accumulating in them rather than replacing the previous run's --
+    a fresh, uniquely-named consumer group still reads every prior run's
+    messages too (`auto.offset.reset: earliest`), inflating counts and
+    occasionally resolving "last per flight" to a stale run. See
+    DECISIONS.md.
+    """
+    import time as _time
+
+    from confluent_kafka.admin import AdminClient
+
+    admin = AdminClient({"bootstrap.servers": BOOTSTRAP_SERVERS})
+    for f in admin.delete_topics([FEATURES_TOPIC, LATE_TOPIC]).values():
+        try:
+            f.result()
+        except Exception:  # noqa: BLE001 -- "topic doesn't exist yet" is fine
+            pass
+    _time.sleep(1)
+
+
 def main():
     bounded = "--bounded" in sys.argv
+    if bounded:
+        _reset_output_topics()
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_runtime_mode(RuntimeExecutionMode.STREAMING)
     env.set_parallelism(1)

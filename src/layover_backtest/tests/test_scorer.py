@@ -160,6 +160,43 @@ def test_cancelled_flight_never_leaks_into_pending_state():
     assert scorer.pending == {}
 
 
+def test_leg_index_stays_frozen_at_schedule_time_through_later_legs():
+    # Regression test for a real bug (found in Milestone 7): _feature_dict
+    # used to re-read the *live* leg_index counter instead of the value
+    # handle_event already froze onto `flight` at schedule time. Since the
+    # live counter keeps advancing as this tail's later legs get their own
+    # schedule events, f1's leg_index would have been reported as 1 (or
+    # higher) by the time f2's schedule event bumped the shared counter --
+    # it must stay 0, the value true at f1's own schedule time, through
+    # every later re-score. See DECISIONS.md.
+    d = date(2026, 1, 15)
+    flights = pd.DataFrame(
+        [
+            _flight(
+                "f1", "N1", d, "DEN", "ORD", "2026-01-15T08:00:00",
+                actual_dep="2026-01-15T08:00:00", actual_arr="2026-01-15T10:30:00",
+                dep_delay=0.0, arr_delay=22.0,
+            ),
+            _flight("f2", "N1", d, "ORD", "LAX", "2026-01-15T12:00:00"),
+        ]
+    )
+    stream = build_event_stream(flights)
+    scorer = BacktestScorer(airport_tz_map=TZ_MAP)
+    f1_leg_indices = []
+    f2_leg_indices = []
+    for event in stream.to_dict("records"):
+        for request in scorer.handle_event(event):
+            if request["model"] == "schedule_only":
+                continue  # same feature dict as "rotation" for this event, skip the duplicate
+            if request["flight_id"] == "f1":
+                f1_leg_indices.append(request["leg_index"])
+            elif request["flight_id"] == "f2":
+                f2_leg_indices.append(request["leg_index"])
+
+    assert f1_leg_indices == [0, 0]  # schedule, then departed -- never bumped by f2's schedule
+    assert f2_leg_indices == [1, 1]  # schedule, then landed-triggered rescore
+
+
 def test_score_requests_empty_input_returns_empty_frame():
     result = score_requests([], _models(), CATEGORIES)
     assert len(result) == 0

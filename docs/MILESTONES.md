@@ -377,20 +377,30 @@ A real performance saga, documented in full in DECISIONS.md:
 
 ### The headline result, with the caveat it needs
 
-**66.0% recall, 232-minute median lead time** for detecting a real
+**Updated 2026-10-10 (Milestone 7):** re-measured after fixing a real
+bug in `BacktestScorer._feature_dict` (it re-read the *live* `leg_index`
+counter instead of the value frozen at schedule time, feeding the
+trained models a subtly wrong value at serving time throughout this
+milestone's original run — see DECISIONS.md). The numbers below are the
+corrected, current ones.
+
+**64.9% recall, 219-minute median lead time** for detecting a real
 15+-minute delay before scheduled departure, using the rotation-aware
-model — rising to **74.9% recall** for flights that have any inbound
-aircraft to track at all (vs. 5.9% for a tail's first leg of the day,
+model — rising to **73.9% recall** for flights that have any inbound
+aircraft to track at all (vs. 3.9% for a tail's first leg of the day,
 where no rotation signal can possibly exist). The schedule-only model's
 nominal "1,440-minute lead time" is a simulation artifact (it only ever
 scores once, 24h ahead, by construction) masking just an 11.0% recall —
 reported deliberately alongside recall, not lead time alone, per the
-early-warning-evaluation research above.
+early-warning-evaluation research above. (Original, pre-fix numbers:
+66.0% / 232 min / 74.9% / 5.9% — the leg_index fix moved these modestly,
+not dramatically, consistent with leg_index being a weak secondary
+signal rather than the rotation model's main driver.)
 
 The MAE cross-check validates the whole harness against Milestone 3's
 offline numbers, using the identical trained models: schedule-only MAE
-29.82 (exact match to Milestone 3's 29.82), post-departure MAE 10.14
-(vs. 10.12), rotation MAE 22.09 (vs. 21.41 — a small, expected, and
+29.82 (exact match to Milestone 3's 29.82), post-departure MAE 10.12
+(exact match), rotation MAE 22.07 (vs. 21.41 — a small, expected, and
 *more* correct divergence from this harness's stricter point-in-time
 discipline, not an error).
 
@@ -550,16 +560,29 @@ Full root-cause writeups for all five in DECISIONS.md.
 
 ### Results (real data: 2026-07-15, 20,055 flights, 61,033 messy events)
 
+**Updated 2026-10-10 (Milestone 7):** the research pass for the
+prediction service traced this job's feature output against the actual
+training schema and found it was missing 8 of 14 required fields
+entirely, plus a `turnaround_minutes` reference-point bug — both fixed,
+along with a related bug in Milestone 4's `BacktestScorer` found by the
+same pass. Full writeup, and why the match rate below reads lower than
+the original 95.8% (a stricter, more trustworthy comparison, not a
+regression), in DECISIONS.md.
+
 - **302 late events** correctly routed to a side output (the messy
   stream displaced ~300 — confirms the mechanism isn't over- or
   under-triggering).
-- **95.8% of flights present in both ground truth and Flink's output
-  match on every feature field.** The remaining 4.2% is the expected
-  consequence of deliberately dropped/very-late data genuinely being
-  unrecoverable information, not a bug — a system can't know what it was
-  never told and correctly discarded as too late to trust.
+- **92.7% of flights present in both ground truth and Flink's output
+  match on every one of the real 14 training-schema fields** (up from
+  checking only 6 fields, against a partly-wrong reference, before this
+  fix). The remaining 7.3% is the expected consequence of deliberately
+  dropped/very-late data genuinely being unrecoverable information, not
+  a bug — a system can't know what it was never told and correctly
+  discarded as too late to trust. Schedule-side fields (carrier/origin/
+  dest/month/day_of_week/dep_hour_local) match 100%, since they don't
+  depend on delivery order.
 - Full bounded run (real JVM, real connector, real Redpanda): **85
-  seconds**.
+  seconds**, unchanged by the fix.
 
 ### Progress notes
 
