@@ -19,7 +19,7 @@ planned).
       rotation linking and feature updates.
 - [x] **7. Prediction service** — FastAPI serving risk and explanations
       from online features.
-- [ ] **8. Trip monitoring and alerts** — Temporal workflows, deduplicated
+- [x] **8. Trip monitoring and alerts** — Temporal workflows, deduplicated
       push and email alerts, kill tests.
 - [ ] **9. Web app** — Trips, live risk, aircraft chain view,
       notifications.
@@ -692,3 +692,141 @@ above, in DECISIONS.md.
 - Deferred nothing in this milestone's own scope. `p_miss` is a named
   sequencing dependency on Milestone 8's `TripLeg` entity, exactly like
   Milestone 4's identical gap — not a dropped requirement.
+
+## Milestone 8 — Trip monitoring and alerts
+
+**Goal:** a long-running Temporal workflow per trip that watches its
+flights for days, survives a real restart, and alerts only when
+connection risk crosses a threshold or changes meaningfully — real
+Temporal, a real database, real notification channels, and a real kill
+test, not a simulation of any of them.
+
+### A research pass before any workflow code
+
+Five concrete questions answered before writing `workflow.py`: how to
+run a real (non-dev-server) Temporal server locally without Homebrew;
+which `temporalio` version this project's Python 3.9 can install
+(1.18.1 — 1.19.0+ needs 3.10, a real named tradeoff); the correct
+workflow/activity/signal/query shapes; what Temporal's retries actually
+guarantee (at-least-once, never exactly-once — the real dedup has to be
+application-level, which is exactly what the spec's `Alert.dedup_key`
+field is for); and what a Workflow ID actually prevents. Full writeup,
+and why each answer shaped the design, in DECISIONS.md.
+
+### What was built
+
+- `infra/docker-compose.yml` — a real self-hosted Temporal server
+  (`temporalio/auto-setup`, sharing this project's existing Postgres
+  rather than a second container), `temporal-ui`, and Mailpit (a real
+  local SMTP catcher for the email channel).
+- `src/layover_trip/db.py` — the real `trips`/`trip_legs`/`alerts`/
+  `risk_assessments` schema in TimescaleDB (the spec's own data model,
+  applied for the first time — Milestone 1 provisioned this database but
+  nothing used it as real application storage until now).
+  `risk_assessments` is a hypertable, matching the spec's "positions and
+  conditions as time series" pattern extended to risk history.
+- `src/layover_trip/risk.py` — turns a Milestone 7 point-prediction into
+  `p_miss` using empirically measured residual-quantile tables (101
+  points, n=612,038, one per model) rather than an assumed Gaussian
+  error model — the same research-before-implementing discipline
+  Milestone 3's feature design used.
+- `src/layover_trip/alerts.py` — the threshold-plus-hysteresis alert
+  policy (`decide_alert`): pure, no I/O, pinned by 6 unit tests covering
+  first-crossing, non-spam-on-staying-elevated, meaningful-escalation,
+  and reset-on-drop-then-fresh-recross.
+- `src/layover_trip/workflow.py` / `activities.py` — the actual
+  `TripMonitorWorkflow`: a durable check loop
+  (`workflow.wait_condition(..., timeout=...)`, not `asyncio.sleep`),
+  a `stop_watching` signal, `get_latest_assessments`/`get_alert_counts`
+  queries, and activities for the real I/O (calling the Milestone 7
+  prediction service, persisting risk assessments, sending alerts).
+- `src/layover_trip/notify.py` — real SMTP to Mailpit; real Web Push
+  (VAPID-signed, AES128GCM-encrypted via `pywebpush`) with a
+  self-generated VAPID identity (no external account needed).
+- `scripts/run_trip_worker.py`, `start_trip_monitor.py`,
+  `verify_trip_monitoring.py` — the worker process, a real trip-creation
+  script using a genuine tight connection from the Milestone 2 dataset,
+  and the full live kill test.
+- 13 new unit tests (6 for the alert policy, 7 for the risk calibration)
+  plus a 7-test regression suite entry for a real upstream bug found
+  while fixing this milestone's own `BacktestScorer` reuse (see below).
+
+### Bugs found building and live-testing this milestone (five, all fixed)
+
+1. `py_vapid==1.9.2`'s `generate_keys()` is broken against
+   `cryptography==46.0.0` (passes a class where an instance is required)
+   — a confirmed upstream bug, worked around directly.
+2. Temporal's workflow-determinism sandbox statically validates every
+   module a workflow file imports, transitively — `requests` and this
+   project's own `notify.py` (a module-level `Path.resolve()` call)
+   both tripped it, even though neither ever runs inside the workflow's
+   own deterministic replay. Fixed via Temporal's own sandbox-passthrough
+   mechanism.
+3. Temporal's strict dataclass converter rejects `None` for a field
+   typed as plain `float`/`int`, not `Optional[...]` — broke workflow-
+   input deserialization for a trip's last leg (which genuinely has no
+   next connection). Fixed by typing every nullable field `Optional`.
+4. An unread `subprocess.Popen(stdout=PIPE)` deadlocks once a chatty
+   child process's output fills the OS pipe buffer — looked exactly
+   like a hung worker. Fixed by logging to a real file instead.
+5. **The substantial one**: on Python 3.9, `asyncio.TimeoutError` is a
+   *different class* from the builtin `TimeoutError` (unified only in
+   3.11) — `workflow.wait_condition`'s timeout exception escaped an
+   `except TimeoutError:` entirely, which Temporal correctly treated as
+   the whole workflow crashing, not a timeout being handled. This
+   silently invalidated an earlier "passing" kill-test run (the workflow
+   had already crashed before the kill even happened); re-confirmed
+   after the fix using Temporal's own workflow history, not just the
+   test's assertions.
+
+Full root-cause writeups for all five in DECISIONS.md.
+
+### The real kill test (2026-10-11, a genuine tight connection from real data)
+
+UA539 (ORD→DFW) departed 115 minutes late in the real historical data;
+AA1402 (DFW→AUS) was scheduled only 52 minutes after UA539's *scheduled*
+arrival — a 45-minute minimum connection time leaving 7 real minutes of
+slack. Not scripted to look dramatic; the dataset already contains it.
+
+- Real `p_miss = 0.995` computed; exactly one real alert fired (one
+  `alerts` row, one real email in Mailpit).
+- Worker `SIGKILL`ed outright. Server-side workflow status: still
+  `RUNNING`, confirmed via `describe()`, with zero workers polling.
+- A full check interval elapsed with no worker running at all: zero new
+  alerts (confirmed directly against the database).
+- A fresh worker resumed monitoring — confirmed via Temporal's own
+  workflow history, not just this test's assertions: `fetch_leg_assessment`
+  was genuinely scheduled a second and third time across two real timer
+  fires. `send_alert` was **not** scheduled again (risk hadn't changed),
+  and the single `alerts` row for the connection's dedup key never
+  became two.
+- `stop_watching()` signaled; the workflow's `run()` returned for real
+  and the trip's database row transitioned to `status='completed'`.
+
+**No trip stopped being watched, no duplicate alert** — the spec's own
+kill-test wording, demonstrated against a real crash.
+
+### Web Push: real protocol, one documented environment limitation
+
+The real Web Push protocol (VAPID + AES128GCM) is fully implemented and
+exercised with a real generated subscriber keypair and a real HTTP
+delivery (confirmed: correct VAPID JWT, correct encryption, correct
+headers). A literal browser-issued subscription needs Milestone 9's
+subscribe UI (or a real external browser) — this session's own sandboxed
+browser tool has Service Worker registration disabled at the engine
+level, confirmed live, not assumed (a plain `fetch()` of the identical
+URL succeeds; `serviceWorker.register()` does not). A named, re-openable
+gap, not a silent one — full writeup in DECISIONS.md.
+
+### Progress notes
+
+- Lint and all 90 unit tests (77 from Milestones 1–7 + 13 new) pass
+  clean.
+- Deferred nothing buildable in this milestone's own scope. Email uses a
+  real local SMTP catcher (Mailpit) rather than Amazon SES — a named,
+  reversible substitution (identical protocol, different
+  host/credentials) made because SES needs a real AWS account this
+  project doesn't have at this stage, not a shortcut around the alerting
+  logic itself. Full Web Push browser verification is a sequencing
+  dependency on Milestone 9's subscribe UI, exactly like Milestone 4's
+  TripLeg gap and Milestone 7's `p_miss` gap before it.

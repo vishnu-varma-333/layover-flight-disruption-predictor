@@ -20,6 +20,7 @@ infra/.volumes/
 # too large and too easily re-fetched to belong in git
 data/raw/
 data/processed/
+data/vapid/
 mlruns/
 
 # OS

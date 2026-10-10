@@ -434,3 +434,62 @@ A cross-check re-derived one flight's prediction independently — same
 Redis record, same MLflow model, no HTTP layer involved — and it
 matched the service's own HTTP response exactly, confirming the
 response is the real model's real output, not a well-shaped stub.
+
+## Milestone 8 — Trip monitoring and alerts
+
+### Setup
+
+`scripts/verify_trip_monitoring.py`, 2026-10-11, against a real
+self-hosted Temporal server (`infra/docker-compose.yml`), a real worker
+subprocess this script itself starts and `SIGKILL`s, the real Milestone
+7 prediction service, the real TimescaleDB trip schema, and a real
+Mailpit SMTP inbox — no mocks, no simulated restart.
+
+### Connection-risk calibration (measured, not assumed)
+
+| Model | p50 residual | p90 residual | p95 residual | p99 residual |
+| --- | --- | --- | --- | --- |
+| Rotation (pre-departure) | +0.6 min | +37.8 min | +70.8 min | +215.4 min |
+| Post-departure | 0.0 min | +18.4 min | +28.1 min | +58.5 min |
+
+Measured on the real July 2026 holdout (n=612,038 per model, matching
+Milestones 3/4's own evaluation set) — the empirical distribution
+`p_miss` is read off by interpolation. The post-departure model's
+visibly tighter distribution (it already knows this flight's own
+departure delay) is why the workflow switches to it the moment a leg
+departs, same as Milestone 7's own model selection.
+
+### The real kill test (2026-10-11, UA539 ORD→DFW → AA1402 DFW→AUS)
+
+A genuine tight connection from the real dataset: UA539 departed 115
+minutes late; AA1402 was scheduled only 52 minutes after UA539's
+*scheduled* arrival, against a 45-minute minimum connection time — 7
+real minutes of slack.
+
+| Step | Result |
+| --- | --- |
+| Computed `p_miss` | **0.995** (predicted arrival delay 108.8 min vs. 7-min buffer) |
+| Real alerts fired (worker #1) | 1 (one `alerts` row, one real Mailpit email) |
+| Workflow status with worker `SIGKILL`ed, zero workers running | `RUNNING` (`describe()`) |
+| New alerts while no worker was running at all | 0 |
+| `fetch_leg_assessment` activity executions (full run, via real Temporal history) | 3 (across 2 real timer fires, spanning the kill and restart) |
+| `send_alert` activity executions (full run) | 1 (not re-fired on the 2nd/3rd check — risk unchanged) |
+| Rows for the alert's dedup key after restart | 1 (never became 2) |
+| Trip status after `stop_watching()` signaled | `completed` |
+
+**No trip stopped being watched, no duplicate alert** — verified against
+Temporal's own workflow history, not only this test's own assertions.
+
+### Web Push: real protocol, real cryptography, no real browser subscription (environment-limited)
+
+This session's sandboxed browser tool cannot register a Service Worker
+(confirmed live: a plain `fetch()` of the worker script succeeds over
+real HTTP with the correct MIME type; `serviceWorker.register()` fails
+regardless). Verified the strongest alternative instead: a real P-256
+subscriber keypair, a real local HTTP endpoint, and a real `send_push`
+call produced a correctly ES256-signed VAPID JWT, the correct
+`aes128gcm` Content-Encoding header, and a 152-byte AES-GCM-encrypted
+body delivered over a real HTTP connection — the full client-side Web
+Push protocol, genuinely exercised. Only the final "a real browser
+receives and displays it" hop is unverified, pending Milestone 9's
+subscribe UI.

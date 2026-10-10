@@ -129,6 +129,7 @@ def flight_risk(flight_id: str):
 
     return {
         "flight_id": flight_id,
+        "model_name": model_name,
         "model_version": state["model_versions"][model_name],
         "ts": record.get("computed_at_event_time"),
         "source_event_type": record.get("source_event_type"),

@@ -1,4 +1,4 @@
-.PHONY: up down logs verify lint test fetch-data build-data verify-data train-model backtest live-ingest verify-live rotation-produce rotation-job rotation-verify sync-features predict-service verify-predict
+.PHONY: up down logs verify lint test fetch-data build-data verify-data train-model backtest live-ingest verify-live rotation-produce rotation-job rotation-verify sync-features predict-service verify-predict trip-schema trip-worker trip-start verify-trip-monitoring
 
 # LightGBM's macOS wheel needs the libomp OpenMP runtime, which it expects
 # at a Homebrew path this project deliberately doesn't use. scikit-learn's
@@ -69,3 +69,15 @@ predict-service:
 
 verify-predict:
 	DYLD_LIBRARY_PATH="$(LIBOMP_DIR)" .venv/bin/python scripts/verify_prediction_service.py
+
+trip-schema:
+	.venv/bin/python -c "import sys; sys.path.insert(0, 'src'); from layover_trip.db import connect, apply_schema; apply_schema(connect())"
+
+trip-worker:
+	.venv/bin/python scripts/run_trip_worker.py
+
+trip-start:
+	.venv/bin/python scripts/start_trip_monitor.py
+
+verify-trip-monitoring:
+	.venv/bin/python scripts/verify_trip_monitoring.py

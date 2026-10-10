@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Layover push test</title></head>
+<body>
+<button id="subscribe">Subscribe</button>
+<pre id="subscription">(not subscribed)</pre>
+<pre id="received">(no push received yet)</pre>
+<script>
+const VAPID_PUBLIC_KEY = "BKCI71NdQ-E03tN6nnJALijJB75brVJV9HRlz00EFe4CgypBxvWPwUzBCKxhhXZvg6JKYxvbryA64-_aU2eKO8U";
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base64);
+  return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+}
+
+navigator.serviceWorker.register("sw.js").then(async (reg) => {
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    if (event.data && event.data.type === "push-received") {
+      document.getElementById("received").textContent = "RECEIVED: " + event.data.text;
+    }
+  });
+
+  document.getElementById("subscribe").addEventListener("click", async () => {
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+    });
+    document.getElementById("subscription").textContent = JSON.stringify(sub.toJSON());
+  });
+});
+</script>
+</body>
+</html>

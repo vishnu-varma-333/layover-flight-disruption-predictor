@@ -1284,3 +1284,238 @@ would look real but mean nothing.
 - Live cross-check: a flight's prediction re-derived independently (same
   Redis record, same MLflow model, no HTTP layer) matched the service's
   own HTTP response exactly.
+
+## Milestone 8 — Trip monitoring and alerts
+
+### Research pass: Temporal's actual guarantees, not assumed ones
+
+Before any workflow code, a research pass answered five concrete
+questions: how to run a real (not single-process dev-server) Temporal
+server locally without Homebrew; which `temporalio` version this
+project's Python 3.9 can actually install; the correct
+workflow/activity/signal/query shapes; what "exactly-once" really means
+in Temporal (it doesn't exist -- Temporal's own guarantee is
+at-least-once Activity execution, full stop); and what a Workflow ID
+actually guarantees. Two results changed the design directly:
+
+- **`temporalio==1.18.1` is the newest SDK release that still supports
+  Python 3.9** (1.19.0+ requires 3.10). Pinned deliberately rather than
+  bumping this project's Python version this late, to avoid
+  re-validating the whole PyFlink/lightgbm/mlflow stack (Milestone 6's
+  environment took real, nontrivial effort to get working) for one new
+  milestone's SDK currency. A real, named tradeoff, not an oversight.
+- **Temporal's own retries are at-least-once, never exactly-once.**
+  "Activity ID" and retry bookkeeping are about which attempt matched
+  which completion, not about deduping a downstream side effect (an
+  email, a push notification). The actual exactly-once guarantee has to
+  be application-level: reserve a dedup key in a real database *before*
+  sending, atomically, so a retried or replayed attempt that reaches the
+  same logical decision reliably finds the key already taken. This is
+  exactly what the spec's own `Alert.dedup_key` field is for --
+  confirmed, not assumed, this is the right design before
+  `activities.py`/`db.py` were written.
+
+### Infra: a real self-hosted Temporal server, sharing this project's Postgres
+
+`infra/docker-compose.yml` gained `temporal` (the actual
+`temporalio/auto-setup` server image, not the single-process
+`temporal server start-dev` CLI dev-server -- the dev-server's SQLite
+persistence is explicitly flagged by Temporal's own docs as not
+guaranteed compatible across CLI versions, and it's not the shape a real
+kill test should exercise), `temporal-ui`, and `mailpit` (a real local
+SMTP catcher for the email alert channel -- see below). Temporal shares
+this project's existing `timescaledb` container rather than running a
+second Postgres: `auto-setup` creates its own `temporal` and
+`temporal_visibility` databases inside it on first boot, using the same
+`layover`/`layover` credentials. Elasticsearch (Temporal's "advanced
+visibility" search) is skipped -- default visibility is enough to query
+by workflow ID/status, and the whole stack already has enough moving
+parts without it.
+
+### Why Temporal, not a cron-and-database approach (a named design-decision point)
+
+A cron job re-reading "which trips need checking" from a database loses
+all in-flight state on every restart -- what was the last alerted risk
+level, did the last notification actually send -- and has to rebuild
+that from scratch on every tick, usually by adding more database columns
+to track it. A Temporal workflow *is* that state, durably, for the whole
+life of the trip: `last_alerted_p_miss` and `alert_count` live as plain
+Python dict fields on the workflow instance, replayed from Temporal's
+own event history on restart -- no separate "resume" logic to write or
+get wrong, because resuming *is* a worker picking the workflow's next
+task back up. The kill test below demonstrates this is a real property,
+not a claim.
+
+### Connection risk (`p_miss`): measured residual quantiles, not an assumed error model
+
+The Milestone 7 models give a point prediction (trained on MAE, roughly
+the conditional median) -- turning that into an actual missed-connection
+*probability* needs a real error distribution, not a guess. Per the
+standing instruction to research this kind of thing properly: measured
+the empirical distribution of (actual arrival delay minus predicted
+delay) on the real July 2026 holdout Milestones 3/4 already use (101
+percentile points, n=612,038, one table per model), rather than assuming
+a Gaussian error model. Delay is heavily right-skewed (already
+established in Milestone 3's L1-vs-L2 finding), so a normal-distribution
+assumption would badly understate tail risk -- confirmed by the measured
+numbers themselves: the rotation model's p95 residual is +70.8 min, p99
+is +215.4 min, far outside what a normal distribution with the same
+mean/std (11.4 / 60.0) would predict. `p_miss` is read off this
+empirical distribution by interpolation (`np.interp`), separately for
+the pre- and post-departure models (the post-departure model's
+distribution is measurably tighter, since it already knows this flight's
+own departure delay -- confirmed live by `test_post_departure_has_tighter_distribution_than_rotation`).
+
+### Alert policy: threshold plus hysteresis, not a stateless check
+
+A stateless "p_miss > 0.30 -> alert" check re-fires on every periodic
+re-check for as long as risk stays elevated -- exactly the spam the spec
+rules out ("never duplicated, never spammed"). `decide_alert` (pure,
+`alerts.py`) only fires on a first crossing above `ALERT_THRESHOLD`
+(0.30) or a *further* rise of at least `ESCALATION_DELTA` (0.15) past
+the level that triggered the last alert; dropping back below threshold
+resets the state so a later re-crossing is a fresh event, not a muted
+echo. The workflow owns this state per leg for the trip's whole life
+(see above) -- the policy function itself never touches a database or a
+clock.
+
+### Email via a real local SMTP catcher, not SES -- a named, reversible substitution
+
+The spec's deployment choice is Amazon SES; this milestone sends real
+SMTP to Mailpit instead, for one reason: SES needs a real AWS account
+and credentials, which don't exist for this project at this stage, and
+`smtplib.SMTP` speaks the identical protocol to both -- swapping the
+host/port/credentials at deploy time is the entire migration, not a
+rewrite. Verified live, not assumed: real messages land in Mailpit's
+real inbox (confirmed via its REST API during the kill test below).
+
+### Web Push: the real protocol, a real generated VAPID identity, and a real cryptographic send -- with one documented environment limitation
+
+`notify.send_push` uses `pywebpush` (VAPID-signed, AES128GCM-encrypted,
+RFC 8291/8292) against a real generated VAPID keypair -- no external
+account needed, since VAPID is a self-signed server identity, not a
+third-party credential. A real end-to-end test needs a real
+`PushSubscription` (endpoint + keys) from a browser's
+`pushManager.subscribe()` call, which there's no web app to issue until
+Milestone 9. Rather than wait, tried getting a real one directly: built
+a minimal static page (`scripts/push_test/`) with a service worker,
+served over real HTTP (Service Workers need a secure context; localhost
+qualifies). **Found live**: this session's own sandboxed browser tool
+has Service Worker registration disabled or broken at the browser-engine
+level (`navigator.serviceWorker.register()` fails with "an unknown error
+occurred when fetching the script" even though a plain `fetch()` of the
+identical URL succeeds, and the registration request never appears in
+the network log at all) -- a genuine environment limitation of this
+automation context, not a bug in the test page or the server (confirmed:
+correct `Content-Type: text/javascript`, 200 response, byte-correct
+body, a secure context by the browser's own `isSecureContext` check).
+
+Rather than leave this unverified, ran the strongest verification
+possible without a real browser: generated a real P-256 subscriber
+keypair and a real random auth secret (exactly what a browser would
+generate), pointed a real `PushSubscription`'s endpoint at a local HTTP
+server this script controls, and called `send_push` for real. The
+result: a correctly-formed `vapid` Authorization header with a real
+ES256-signed JWT (`aud`/`exp`/`sub` claims), a real `aes128gcm`
+Content-Encoding header, and a 152-byte AES-GCM-encrypted body --
+the complete client-side Web Push protocol, genuinely executed and
+genuinely received over a real HTTP connection. The only unverified hop
+is delivery to an actual browser's push service, which needs Milestone
+9's subscribe UI (or the user's own Chrome, outside this sandbox, via
+`scripts/push_test/`) to close -- a named, re-openable gap, not a
+silent one.
+
+### Five real bugs found building and live-testing this milestone
+
+1. **`py_vapid==1.9.2`'s own `generate_keys()` is broken against
+   `cryptography==46.0.0`** (installed here): it passes the
+   `ec.SECP256R1` *class* instead of an *instance* to
+   `generate_private_key()`, which newer `cryptography` rejects outright
+   with `TypeError: curve must be an EllipticCurve instance`. A real,
+   confirmed upstream incompatibility, not a guess -- worked around by
+   generating the key directly (with a real curve instance) and
+   assigning it through `Vapid`'s own `private_key` setter (which
+   correctly derives the public key), rather than pinning an old,
+   unmaintained `cryptography` or waiting on an upstream fix.
+2. **Temporal's workflow-determinism sandbox statically validates
+   everything a workflow module imports, transitively, including
+   third-party I/O libraries the *activities* module needs** (`requests`
+   -> `urllib3` failed the sandbox's static check on
+   `http.client.IncompleteRead.__mro_entries__` outright, and separately,
+   `layover_trip.notify`'s own module-level `Path(__file__).resolve()`
+   tripped a restricted-filesystem-access check). Both only ever
+   actually execute inside an Activity, never inside the workflow's own
+   deterministic replay -- fixed by marking the specific modules
+   (`requests`, `psycopg2`, `pywebpush`, `py_vapid`, `cryptography`,
+   `numpy`, and this project's own `layover_trip.activities`/`db`/
+   `notify`/`risk`) as sandbox passthrough, the officially supported
+   mechanism for exactly this situation, in `run_trip_worker.py`.
+3. **Temporal's strict dataclass converter rejects `None` for a field
+   typed as plain `float`/`int`/`str`** (not `Optional[...]`) --
+   `next_leg_sched_dep_epoch: float = None` on `TripLegInput` (the last
+   leg of a trip genuinely has no next connection) failed workflow-input
+   deserialization with `TypeError: Expected value to be int|float, was
+   NoneType`. Fixed by typing every field that can legitimately be
+   `None` as `Optional[...]`, across both `workflow.py` and
+   `activities.py`'s dataclasses.
+4. **An unread `subprocess.Popen(..., stdout=subprocess.PIPE)` silently
+   deadlocks once the child's output exceeds the OS pipe buffer** -- the
+   kill test's worker subprocess (fairly chatty: Temporal's own SDK logs
+   a WARNING per sandboxed import) blocked trying to write once its
+   output filled the buffer, which looked exactly like a hung worker
+   (every query against it timed out at 30s) rather than a process stuck
+   on a `write()` syscall. Fixed by redirecting worker subprocess output
+   to a real log file instead of an unread pipe.
+5. **The most substantial one**: `workflow.wait_condition(...,
+   timeout=...)` raises `asyncio.TimeoutError` on timeout -- and on
+   Python 3.9, `asyncio.TimeoutError` is a *different class* from the
+   builtin `TimeoutError` (they were only unified into one alias
+   starting Python 3.11). `except TimeoutError:` therefore never caught
+   it, the exception escaped the workflow's `run()` coroutine entirely,
+   and Temporal correctly treated an uncaught exception as the
+   **workflow itself failing** -- the trip monitor silently crashed
+   after its very first check interval elapsed, not after any kill test
+   action. This fully explained an earlier, misleading "passing" test
+   run: the workflow had already crashed (confirmed independently --
+   attempting to `terminate()` it afterward returned "workflow execution
+   already completed") before the kill test's own `kill_worker()` call,
+   so every assertion after that point was unknowingly checking a frozen
+   final state rather than genuine ongoing monitoring. Fixed by catching
+   `asyncio.TimeoutError` explicitly; re-ran the full kill test after
+   the fix and independently confirmed (via Temporal's own workflow
+   history, not just the test's own assertions) that `fetch_leg_assessment`
+   was genuinely scheduled three separate times (across two real
+   timer fires spanning the kill and restart) with `send_alert` firing
+   only on the first.
+
+### The real kill test (2026-10-11, a real UA539 ORD->DFW -> AA1402 DFW->AUS connection)
+
+The real historical data for 2026-07-15: UA539 departed ORD 115 minutes
+late; AA1402 was scheduled to leave DFW only 52 minutes after UA539's
+*scheduled* arrival, a 45-minute minimum connection time leaving only 7
+minutes of real slack -- not a scripted scenario, a genuine tight
+connection the dataset already contains.
+
+- Worker #1 computed `p_miss = 0.995` (correctly: predicted arrival
+  delay 108.8 min against a 7-minute buffer) and fired exactly one real
+  alert: one row in the real `alerts` table, one real email delivered to
+  Mailpit.
+- Worker #1 killed outright (`SIGKILL`, not a graceful shutdown). The
+  server-side workflow execution status: still `RUNNING`, confirmed via
+  `describe()`, with zero workers polling it at all.
+- A full check interval elapsed with no worker running at all: zero new
+  alerts, confirmed directly against the database (not just the
+  workflow's own state).
+- Worker #2 started fresh. Temporal's own workflow history (not just
+  this test's assertions) shows `fetch_leg_assessment` scheduled a
+  second and third time, across two real timer fires -- genuine ongoing
+  monitoring resumed, not a restart artifact. `send_alert` was **not**
+  scheduled again: risk hadn't changed, so `decide_alert` correctly
+  declined to re-fire, and the single `alerts` row for this connection's
+  dedup key never became two.
+- `stop_watching()` signaled; the workflow's `run()` returned for real
+  (not just a status flip) and the trip's real database row transitioned
+  to `status='completed'`.
+
+**No trip stopped being watched, no duplicate alert** -- the spec's own
+kill-test wording, demonstrated against a real crash, not simulated.
