@@ -775,3 +775,113 @@ it actually applies, and overstate it where it structurally can't (a
 first leg has no inbound aircraft, by definition, no matter how good the
 model is). Honest segmentation beats a single flattering-but-misleading
 average.
+
+## Milestone 5 — Live ingestion
+
+### Verified real API access before designing anything, not assumed from memory
+
+OpenSky's REST API changed its auth model since this project's spec was
+likely last checked against documentation — it now exclusively uses
+OAuth2 client-credentials, not basic auth. Fetched the current docs
+directly rather than relying on memory, and found anonymous access is
+still available (400 credits/day on `/states/all`, 10-second position
+resolution) — matching the spec's own "free for research and
+non-commercial use with a daily credit limit" framing exactly, so no
+external blocker (a paid key or registered account) actually exists here.
+Confirmed NOAA's Aviation Weather API and the FAA's NAS Status feed are
+both fully public and keyless by making real live requests, not reading
+documentation alone (`aviationweather.gov/api/data/{metar,taf}`,
+`nasstatus.faa.gov/api/airport-status-information` — both returned real
+current data for real airports on the first try).
+
+### OpenSky's real credit cost measured empirically, not assumed from docs
+
+Made two real, small-bounding-box calls back to back and compared the
+`X-Rate-Limit-Remaining` response header before and after: it dropped by
+exactly 1 each time. A small per-airport bounding box (~0.26° half-width)
+costs **1 credit per call**, confirmed live rather than trusted from
+OpenSky's own documentation (which describes a grid-based cost model that
+could plausibly charge more for a given area without testing it
+directly). This number drove the actual budgeting design: 15 monitored
+airports × 1 credit, once per hour, costs 360 of the 400 daily credits,
+leaving a 40-credit reserve — not a number picked arbitrarily.
+
+### Credit-aware scheduling: read the real remaining count from the API, never estimate it locally
+
+`CreditBudget` tracks `remaining` directly from each response's
+`X-Rate-Limit-Remaining` header — it has no independent counter of its
+own that could drift from what OpenSky actually thinks the account has
+used. Polling stops for the rest of the day once `remaining` drops to the
+configured reserve (default 40), rather than spending the account to zero
+and risking a lockout before the next UTC reset. This is the spec's own
+named design topic ("Credit budgeting: polling a rate-limited API
+intelligently") applied directly, not left as a vague future concern.
+
+### One Kafka topic, an event_type discriminator — same pattern as Milestone 4, for the same reason
+
+All three ingestors (aircraft positions, airport weather, airport status)
+publish to a single `live.events` topic rather than three separate
+topics. This matches the spec's own description ("normalized into one
+event stream") and reuses Milestone 4's backtest replay topic design:
+Milestone 6's Flink job subscribes to one place for every signal it
+needs, rather than joining across several topics itself.
+
+### Monitored-airport list hardcoded, not read from the Milestone 2 data file at ingestor startup
+
+The 15 demo airports (major US hubs) are a fixed Python list in
+`layover_ingest/airports.py`, with coordinates sourced from the same
+OurAirports reference data Milestone 2 downloaded — but not read from
+that file at runtime. That file is gitignored, multi-hundred-MB, and has
+no reason to exist on a machine that's only running live ingestion (e.g.
+a future production ingestor deployment) rather than the full historical
+pipeline. A fixed list for a fixed, rarely-changing set of major hubs is
+a reasonable simplification; a dynamic, growing monitored-airport set (if
+trip-linked polling is added later, per the spec's "poll only regions tied
+to monitored trips" framing) would need a real lookup service instead —
+noted as a natural extension point when Milestones 8-9 introduce Trips.
+
+### Async per the spec's own tech-stack table, not a default choice
+
+Used `asyncio` + `aiohttp` for all three ingestors, matching the spec's
+tech-stack table verbatim ("Ingestors: Python (async)"). The three
+sources have genuinely different access patterns (OpenSky: many small
+per-airport credit-metered calls; weather: one call covers every airport;
+FAA: one global call, filtered client-side) and run fully concurrently via
+`asyncio.gather`, each on its own independent interval, sharing one Kafka
+producer.
+
+### Bug: a bounded `--duration` test run didn't actually stop on time
+
+**What happened:** a verification run with `--duration 90` was still
+running several minutes later. Root cause: each ingestor's sleep between
+cycles used only its own cycle interval (`interval_seconds - elapsed`),
+with no awareness of the overall run's duration budget. OpenSky's default
+interval is 3600 seconds, so after its one real cycle (which happens
+immediately, duration-budget or not), it would sleep for ~3,593 seconds
+before ever re-checking whether the 90-second budget had elapsed —
+meaning a "bounded" test run would actually run for up to an hour before
+naturally exiting on its own.
+
+**Fix:** extracted the sleep logic into one shared
+`sleep_until_next_cycle(cycle_start, interval_seconds, deadline)` used by
+all three ingestors, which caps the sleep at whatever time remains until
+the overall deadline (when one is set) — not just the cycle interval.
+Verified live: a `--duration 60` run with default intervals now exits in
+61 seconds, not "whenever the longest configured interval happens to
+elapse."
+
+### Live-verified, not CI-automated
+
+`scripts/verify_live_ingestion.py` consumes real events from `live.events`
+for a bounded window and asserts real schema/plausibility properties
+(lat/lon in range, a non-empty raw METAR/TAF string, status events only
+for monitored airports) — run manually (`make live-ingest` +
+`make verify-live`), not added to the GitHub Actions CI pipeline. Unlike
+Milestones 1, 2 and 4's CI jobs (which exercise this project's *own*
+local infrastructure — Redpanda, Postgres — safe and free to run on every
+push), these ingestors call real third-party APIs with a real, shared,
+metered daily credit budget. Running them on every CI push would burn
+through OpenSky's anonymous quota on an unpredictable schedule and make
+test runs depend on three external services' uptime — a deliberate scope
+boundary, not an oversight. CI still runs the offline, fixture-based unit
+tests for all the parsing and scheduling logic on every push.

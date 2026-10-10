@@ -265,3 +265,53 @@ inbound leg's outcome if that leg has *actually landed* by the time of
 scoring), while Milestone 3's batch feature table always uses the
 eventual actual outcome regardless of whether it would genuinely be known
 yet — a small, rare look-ahead this replay deliberately does not have.
+
+## Milestone 5 — Live ingestion
+
+### Setup
+
+`scripts/run_live_ingestion.py`, 2026-10-10, real requests against
+OpenSky Network, NOAA's Aviation Weather Center API, and the FAA's NAS
+Status feed, publishing to the real Redpanda stack. 15 monitored US hub
+airports (ATL, BOS, CLT, DEN, DFW, IAH, JFK, LAS, LAX, MCO, MIA, ORD, PHX,
+SEA, SFO).
+
+### OpenSky credit cost (measured directly, not assumed from documentation)
+
+**Setup:** two real `/states/all` calls with a small (~0.26° half-width)
+bounding box each, comparing the `X-Rate-Limit-Remaining` response header
+before and after.
+
+**Result:** exactly **1 credit per call** (398 -> 397 -> 396 across two
+consecutive calls). This number, not a documentation-derived guess, drove
+the budgeting design: 15 airports x 1 credit = 15 credits per full
+rotation, so an hourly cadence costs 360 of the 400 daily credits,
+leaving a 40-credit reserve.
+
+### Bounded-run scheduling fix: before and after
+
+**Setup:** `scripts/run_live_ingestion.py --duration N`, wall-clock timed
+from launch to process exit, with every ingestor at its production-
+default interval (OpenSky 3600s, weather 900s, status 300s).
+
+**Result:**
+- Before the fix (`--duration 90`): still running several minutes later
+  (the process was manually killed, not timed to completion — see
+  DECISIONS.md for why).
+- After the fix (`--duration 60`): exited cleanly at **61 seconds**.
+
+### Live data volume (one 60-second bounded run)
+
+| Event type | Count | Notes |
+| --- | --- | --- |
+| `aircraft_position` | 571 | one cycle across all 15 monitored airports |
+| `airport_weather` | 30 | 15 airports x (1 METAR + 1 TAF) |
+| `airport_status` | 0-2 | depends on real, currently-active FAA delay programs/closures at monitored airports (observed 1 real closure for LAX during testing) |
+
+### Live verification
+
+`scripts/verify_live_ingestion.py`, consuming for 20 seconds against
+events already published: all checks passed against real data (a
+plausible lat/lon and non-empty callsign/icao24 on a real aircraft
+position, a non-empty raw METAR/TAF report, and status events correctly
+restricted to the monitored airport set).

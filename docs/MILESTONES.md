@@ -13,7 +13,7 @@ planned).
       with rotation, turnaround and airport features; tracked in MLflow.
 - [x] **4. Backtesting harness** — Replay historical days through Kafka and
       measure lead time and accuracy. First headline numbers.
-- [ ] **5. Live ingestion** — OpenSky, weather and airport-status ingestors
+- [x] **5. Live ingestion** — OpenSky, weather and airport-status ingestors
       with credit budgeting.
 - [ ] **6. Stream processing** — Flink jobs for event-time handling,
       rotation linking and feature updates.
@@ -407,3 +407,82 @@ discipline, not an error).
   connection time that doesn't exist yet (Milestones 8-9), a sequencing
   dependency like Milestone 3's airport-condition features, not a
   dropped requirement.
+
+## Milestone 5 — Live ingestion
+
+**Goal:** stop being purely historical. Build real, continuously-running
+ingestors for aircraft positions (OpenSky), airport weather (NOAA) and
+airport status (FAA), normalized into one Kafka event stream, with
+credit-aware polling for the one source that's actually rate-limited.
+
+### What was built
+
+- `src/layover_ingest/opensky.py` — polls OpenSky's `/states/all` for 15
+  monitored US hub airports' local airspace, tracking real remaining
+  daily credits directly from the API's own response header (never
+  estimated locally) and stopping for the day once a configurable reserve
+  is reached.
+- `src/layover_ingest/weather.py` — polls NOAA's Aviation Weather API for
+  METAR and TAF reports, all 15 monitored airports in two calls total
+  (not per-airport) since this source isn't credit-limited.
+- `src/layover_ingest/airport_status.py` — polls the FAA's public NAS
+  Status XML feed (one global endpoint covering every US airport),
+  parsing generically by delay category so new FAA fields or categories
+  don't need a code change to be captured, filtered to the monitored set.
+- `src/layover_ingest/scheduling.py` — the shared cycle-sleep logic every
+  ingestor uses (see the bug below).
+- `scripts/run_live_ingestion.py` — runs all three concurrently via
+  `asyncio.gather`, sharing one Kafka producer, for either a bounded
+  `--duration` (verification) or indefinitely (real deployment).
+- `scripts/verify_live_ingestion.py` — live checks against real consumed
+  events (plausible lat/lon, a non-empty raw weather report, status
+  events restricted to monitored airports), not fixtures.
+- A verification-first research pass before building anything: confirmed
+  live that OpenSky's anonymous tier still exists and measured its real
+  per-call credit cost empirically (exactly 1 credit for a small bounding
+  box — two real calls, comparing the rate-limit header before and
+  after), rather than trusting assumptions or documentation alone.
+- 13 new unit tests, all offline against real-shaped fixture data
+  (captured live during development, not hand-invented): OpenSky state-
+  vector parsing and credit-budget logic, METAR/TAF parsing, FAA XML
+  parsing (including that an unmonitored airport like PNS is correctly
+  filtered out), and the cycle-scheduling fix.
+
+### Bug found during live verification
+
+A `--duration 90` test run was still running several minutes later.
+Root cause: each ingestor's sleep between cycles considered only its own
+interval (OpenSky defaults to 3600s), never the overall run's duration
+budget — so after its first real cycle, it would sleep for the better
+part of an hour before ever checking whether the 90-second budget had
+elapsed. Fixed with one shared `sleep_until_next_cycle` helper that caps
+the sleep at whatever's left of the overall deadline. Verified live: a
+`--duration 60` run with production-default intervals now exits at 61
+seconds, not whenever its longest configured interval happens to elapse.
+
+### Live verification (real data, real external APIs)
+
+A bounded 60-second run produced, and `verify_live_ingestion.py`
+confirmed via direct Kafka consumption: 571 real `aircraft_position`
+events (live flights near the 15 monitored hubs, including a real United
+flight's callsign, position and ground state at SFO), 30 real
+`airport_weather` events (METAR + TAF for all 15 airports), and a real
+`airport_status` event (an actual current FAA closure notice for LAX,
+correctly excluding a simultaneous closure at an unmonitored airport).
+Credits dropped by exactly 15 (one per monitored airport), consistent
+with the measured 1-credit-per-call cost.
+
+### Progress notes
+
+- Lint and all 53 unit tests (40 from Milestones 1-4 + 13 new) pass clean.
+- Live ingestion is deliberately not part of automated CI — unlike prior
+  milestones' CI jobs (which exercise this project's own local infra),
+  these ingestors call real third-party APIs against a real, shared,
+  metered daily budget. Running them on every push would burn OpenSky's
+  anonymous quota unpredictably; CI still runs every offline unit test.
+- Deferred nothing in this milestone's own scope. Trip-linked targeted
+  polling (narrowing OpenSky queries to aircraft tied to a specific
+  monitored trip, rather than a fixed demo-airport list) is a natural
+  extension once Milestones 8-9 introduce the Trip entity — a sequencing
+  dependency, not a dropped requirement, exactly like Milestone 3's
+  deferred live-weather features were resolved by this milestone.
