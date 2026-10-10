@@ -73,3 +73,89 @@ restart command to `healthy` status via polling
 restart (2026-10-09) — i.e. under ~6 seconds including the poll's own
 granularity. The verification suite passed immediately after with no
 manual intervention.
+
+## Milestone 2 — Historical data
+
+### Download throughput (BTS On-Time Performance zips, this sandbox's network)
+
+**Setup:** `stat` on a growing destination file, sampled before and after a
+clean 30-second sleep, while `scripts/fetch_historical_data.py` was the
+only active transfer.
+
+**Result:** 23 KB/s sustained (2026-10-09). Highly variable in practice —
+individual ~27-33 MB monthly files took anywhere from ~10 to ~20 minutes
+each depending on the sample window. Across all 12 months + the OurAirports
+reference file (~370 MB total), wall-clock time from first byte to last
+byte was approximately 2 hours 20 minutes. This is a property of this
+sandbox's network path to transtats.bts.gov, not of the download code —
+reported here because it's the real, measured number, not because it's
+expected to generalize to another machine.
+
+### Cleaning throughput (BTS CSV -> UTC-timestamped Flight records)
+
+**Setup:** wall-clock timestamps from `scripts/build_historical_data.py`'s
+own per-month log lines, final run, 2026-10-10, all 12 months already on
+local disk (download time excluded).
+
+**Result:** 7,043,858 flights cleaned from 12 real monthly files in 243.0s
+total (sum of per-month times, 14.8s-29.1s each, mean 20.25s/month) —
+**~28,990 flights/sec**. Per-month time grows mildly across the series
+(14.8s for the first month processed to 29.1s for the last) consistent
+with steadily growing Python object/string overhead as more month
+DataFrames accumulate in memory before the final concat, not a per-row
+slowdown.
+
+### Rotation-building: before and after the vectorization fix
+
+**Setup:** wall-clock between `build_historical_data.py`'s "total cleaned
+flights" and "total rotations" log lines, same real dataset
+(7,043,858 flights -> 1,747,220 rotations) both times.
+
+**Result:**
+- Original groupby + per-group Python loop implementation: killed after
+  **20+ minutes** with no completion in sight (not a measured endpoint —
+  genuinely did not finish; see DECISIONS.md).
+- Vectorized rewrite (`groupby().agg()` + within-group `.shift()`), first
+  successful run: **40.5 seconds**.
+- Vectorized rewrite, final run (after an additional correctness fix to
+  `clean.py` for non-positive elapsed times, which doesn't touch
+  `rotations.py` but was timed again for the authoritative end-to-end run
+  below): **52.3 seconds**. The 12-second difference between these two
+  vectorized runs is ordinary run-to-run variance on a shared dev laptop
+  (other processes, thermal state), not a regression — both are
+  2-3 orders of magnitude faster than the original.
+
+### End-to-end pipeline (final, authoritative run)
+
+**Setup:** `scripts/build_historical_data.py`'s own reported
+`total pipeline time`, 2026-10-10, all 12 months already downloaded.
+
+**Result:** 307.7s total — 243.0s cleaning all 12 months, 52.3s building
+rotations, 8.1s writing both Parquet files. End-to-end throughput:
+**~22,890 flights/sec** including all I/O.
+
+### Live DuckDB verification suite runtime
+
+**Setup:** wall-clock around `scripts/verify_historical_data.py` (7 checks:
+null fields, unique flight IDs, scheduled/actual arrival ordering,
+cancelled-flight consistency, rotation referential integrity, rotation leg
+counts) against the real 7,043,858-row / 1,747,220-row processed dataset.
+
+**Result:** 3 seconds (2026-10-10).
+
+### Output dataset size
+
+**Result:** `flights.parquet` 175.4 MB (7,043,858 rows), `rotations.parquet`
+73.9 MB (1,747,220 rows) — both Snappy-compressed via pandas' default
+Parquet writer, no tuning applied.
+
+### Data-quality summary (from the real dataset, not a sample)
+
+| Metric | Value |
+| --- | --- |
+| Total flights (12 months, Aug 2025-Jul 2026) | 7,043,858 |
+| Flights with a tail number (rotation-eligible) | 7,026,084 (99.7%) |
+| Rotations (tail_number x day) | 1,747,220 |
+| Multi-leg rotations | 1,613,595 (92.4%) |
+| Chain breaks (ferry/equipment-swap signal) | 123,669 |
+| Rows with unresolvable scheduled arrival (fixed) | 14 (negative source `CRSElapsedTime` — see DECISIONS.md) |

@@ -1,0 +1,10 @@
+"id","ident","type","name","latitude_deg","longitude_deg","elevation_ft","continent","iso_country","iso_region","municipality","scheduled_service","icao_code","iata_code","gps_code","local_code","home_link","wikipedia_link","keywords"
+3550,"KDEN","large_airport","Denver International Airport",39.861698,-104.6731,5431,"NA","US","US-CO","Denver","yes","KDEN","DEN","KDEN","DEN",,,
+3830,"KORD","large_airport","Chicago O'Hare International Airport",41.9786,-87.9048,672,"NA","US","US-IL","Chicago","yes","KORD","ORD","KORD","ORD",,,
+3617,"KJFK","large_airport","John F Kennedy International Airport",40.639447,-73.779317,13,"NA","US","US-NY","New York","yes","KJFK","JFK","KJFK","JFK",,,
+3484,"KLAX","large_airport","Los Angeles International Airport",33.942501,-118.407997,125,"NA","US","US-CA","Los Angeles","yes","KLAX","LAX","KLAX","LAX",,,
+3448,"PANC","large_airport","Ted Stevens Anchorage International Airport",61.174397,-149.996108,152,"NA","US","US-AK","Anchorage","yes","PANC","ANC","PANC","ANC",,,
+3617,"PHNL","large_airport","Daniel K Inouye International Airport",21.318681,-157.922428,13,"NA","US","US-HI","Honolulu","yes","PHNL","HNL","PHNL","HNL",,,
+999999,"XXDUP","small_airport","Duplicate IATA Test Airport",40.0,-105.0,5000,"NA","US","US-CO","Nowhere","no",,"DEN","XXDUP","DEN",,,
+6384,"TJSJ","large_airport","Luis Munoz Marin International Airport",18.4394,-66.001801,9,"NA","PR","PR-U-A","San Juan","yes","TJSJ","SJU","TJSJ","SJU",,,
+3766,"KPBI","large_airport","President Donald J. Trump International Airport",26.683201,-80.095596,19,"NA","US","US-FL","West Palm Beach","yes","KDJT","DJT","KDJT","DJT",,,"PBI, KPBI, MFW, South Florida"
