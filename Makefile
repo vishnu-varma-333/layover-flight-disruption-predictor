@@ -1,4 +1,10 @@
-.PHONY: up down logs verify lint test fetch-data build-data verify-data
+.PHONY: up down logs verify lint test fetch-data build-data verify-data train-model
+
+# LightGBM's macOS wheel needs the libomp OpenMP runtime, which it expects
+# at a Homebrew path this project deliberately doesn't use. scikit-learn's
+# wheel already bundles a compatible libomp.dylib -- point the dynamic
+# linker at it instead of installing anything new. See DECISIONS.md.
+LIBOMP_DIR := $(shell .venv/bin/python -c "import sklearn, os; print(os.path.join(os.path.dirname(sklearn.__file__), '.dylibs'))")
 
 up:
 	docker compose -f infra/docker-compose.yml up -d --wait --wait-timeout 180
@@ -26,3 +32,6 @@ build-data:
 
 verify-data:
 	.venv/bin/python scripts/verify_historical_data.py
+
+train-model:
+	DYLD_LIBRARY_PATH="$(LIBOMP_DIR)" .venv/bin/python scripts/train_model.py

@@ -159,3 +159,54 @@ Parquet writer, no tuning applied.
 | Multi-leg rotations | 1,613,595 (92.4%) |
 | Chain breaks (ferry/equipment-swap signal) | 123,669 |
 | Rows with unresolvable scheduled arrival (fixed) | 14 (negative source `CRSElapsedTime` — see DECISIONS.md) |
+
+## Milestone 3 — Baseline and model
+
+### Setup (applies to every number in this section)
+
+`make train-model` (`scripts/train_model.py`), 2026-10-10, against the
+real Milestone 2 output (7,043,858 flights, same machine as above). Time
+split: train = Aug 2025-Jun 2026 (6,283,472-6,283,473 rows depending on
+target's own null-filtering), test = Jul 2026 (612,038 rows). Objective
+`regression_l1` (see DECISIONS.md for why, found via a real result that
+looked wrong under the L2 default).
+
+### Pipeline timing
+
+| Phase | Time |
+| --- | --- |
+| Feature engineering (7,043,858 rows: timezone conversion + rotation/turnaround features, fully vectorized) | 23s |
+| Train + evaluate + MLflow-log: departure delay model | ~113s |
+| Train + evaluate + MLflow-log: arrival delay, pre-departure, full model | ~117s |
+| Train + evaluate: arrival delay schedule-only ablation + train/evaluate/log arrival delay post-departure model (combined; no clean boundary between these two in the captured log) | ~193s |
+| **Total, feature table load to final result printed** | **447s (~7.5 min)** |
+
+### Model accuracy (MAE in minutes, lower is better; real holdout, 612,038 flights)
+
+| Model | Naive median MAE | Schedule-only MAE | Full (rotation) MAE |
+| --- | --- | --- | --- |
+| Departure delay | 26.95 | — | **15.55** |
+| Arrival delay, pre-departure | 31.36 | 29.82 | **21.41** |
+| Arrival delay, post-departure (own `dep_delay_min` known) | 31.36 | — | **10.12** |
+
+**Headline result:** rotation/turnaround features reduce arrival-delay
+MAE by **28.2%** versus a schedule-only model of the identical algorithm,
+trained and evaluated identically (21.41 vs. 29.82 minutes) — an isolated
+measurement of this project's core hypothesis, not a comparison against a
+deliberately weak baseline. Once a flight has actually departed, knowing
+its own departure delay sharpens the arrival estimate by a further 52.7%
+(21.41 -> 10.12 minutes).
+
+### A result that looked wrong, and what it was measuring instead
+
+Under LightGBM's default L2 (squared-error) objective, the schedule-only
+ablation scored MAE 32.39 — *worse* than the naive median floor (31.36).
+This was investigated rather than reported: diagnosed as an objective/
+metric mismatch (L2 targets the conditional mean; MAE is minimized by the
+median; delay is right-skewed enough that the difference mattered for a
+weak-signal model). Re-run with `regression_l1` for every model: the
+schedule-only ablation correctly improved to 29.82 (now beating the naive
+floor, as any real model should), and the full arrival-delay model also
+improved (22.82 -> 21.41). Both L2 and L1 numbers are included here
+because the difference, and *why* it happened, is itself a real finding —
+not because the L2 numbers are a valid benchmark to compare against.

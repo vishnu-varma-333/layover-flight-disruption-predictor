@@ -419,3 +419,200 @@ elapsed time, it's to say "this specific field is known-bad, don't trust
 a value derived from it." The alternative (clamping to some minimum
 elapsed time, or inferring from distance/aircraft type) would quietly
 fabricate data the source never actually provided.
+
+## Milestone 3 — Baseline and model
+
+### Feature design grounded in a literature pass, not just intuition
+
+Before writing `features.py`, searched for published work on reactionary/
+delay-propagation prediction rather than designing the feature set from
+first principles alone. Found arXiv:2605.07364 (verified real via a direct
+fetch of the paper, not taken on faith from a search snippet — it's a very
+recently submitted paper, so that verification mattered), which reports
+11 delay-propagation features derived from tail-number rotation chains
+(previous-flight arrival delay, turnaround time, a *tight-turnaround
+indicator*, cumulative same-day aircraft delay) producing the dominant
+performance gain in their study (AUC 0.732 -> 0.875, schedule-only ->
+rotation-chain features). Two features this project's original design
+pass hadn't included were added as a direct result:
+
+- **`tight_turnaround`**: a binary flag for turnaround time under 45
+  minutes (the paper's cited standard minimum practical narrow-body
+  domestic turnaround under normal gate operations), not just the raw
+  continuous `turnaround_minutes` value. A GBM *can* approximate a
+  threshold split on its own, but an explicit indicator for a genuinely
+  operationally-meaningful threshold is a known-useful practice when that
+  threshold is domain knowledge, not something to hope the model
+  rediscovers from scratch.
+- **`cum_delay_today`**: the tail's running total of already-landed legs'
+  delay so far that day (not just the immediately preceding leg) —
+  captures that a day with several compounding small delays is a
+  different risk profile than one bad leg, which a previous-leg-only
+  feature can't see.
+
+**Considered and deliberately deferred:** the same paper (and other
+search results) describe graph-based airport-network-centrality features
+(e.g. PageRank over the route network) and meta-models (a model whose
+output feeds another model, e.g. predicting upstream flight duration as
+an input feature). Not built for v1: a GBM already learns airport-specific
+effects directly from categorical origin/dest splits, so centrality
+features are largely redundant signal dressed up as novelty at this
+project's scale; a meta-model adds real training/serving complexity
+(versioning and keeping two models in sync) for a project whose actual
+differentiators are the rotation-tracking data engineering and production
+rigor, not feature-engineering novelty. Revisit only if Milestone 4's
+backtest shows the categorical airport features are under-capturing
+airport-level effects.
+
+### Vectorized feature engineering, deliberately, informed by the Milestone 2 bug
+
+Both the local-timezone conversion and the rotation/turnaround features
+are written as vectorized groupby operations from the start (grouping by
+the airport's IANA timezone -- only ~15 distinct zones across all US
+airports -- for the time features, and by (tail_number, fl_date) with
+`.shift()`/`.cumsum()` for the rotation features) rather than any
+per-row or per-tiny-group Python loop. This is a direct, deliberate
+application of the lesson from Milestone 2's rotation-building
+performance bug (see above): confirmed on the real 7,043,858-row dataset,
+building the full feature table (local time + all 8 rotation/turnaround
+features) took **~23 seconds** — no repeat of that earlier mistake.
+
+### Model objective: L1 (MAE), not LightGBM's L2 default — found by comparing results, not assumed
+
+**What happened:** the schedule-only ablation model for arrival delay
+(trained with LightGBM's default `regression` objective, which minimizes
+squared error) scored a test MAE of 32.39 minutes — *worse* than simply
+predicting the training set's median delay for every row (31.36 minutes).
+That's a red flag precisely because the median is the single best
+constant predictor *under MAE specifically* (it minimizes MAE by
+definition) — a model with real, if weak, information should still beat
+it.
+
+**Root cause:** LightGBM's default L2 objective targets the conditional
+*mean*; MAE is minimized by the conditional *median*. Flight delay is
+heavily right-skewed (most flights near zero or early, a long tail of
+large delays), so the mean sits well above the median, and a mean-
+targeting model systematically overshoots on the large share of near-zero
+flights — directly hurting MAE. The schedule-only model's features are
+weak enough that this mismatch dominated its performance; the full
+model's much stronger rotation signal was enough to overcome the same
+mismatch, which is exactly why the bug stayed hidden until the ablation
+comparison surfaced it.
+
+**Fix:** switched every model to `objective: "regression_l1"` (LightGBM
+trains directly against MAE). Re-running confirmed the diagnosis: the
+schedule-only model's MAE improved to 29.82 (now correctly beating the
+31.36 naive floor), and the full model's arrival-delay MAE also improved
+(22.82 -> 21.41). The *qualitative* conclusion (rotation features help a
+lot) was never in doubt, but the quantitative ablation margin was wrong
+under L2 and only became a trustworthy, apples-to-apples number once both
+models were evaluated under the same loss that matches the reported
+metric.
+
+**Why this belongs here:** it's a textbook objective/metric mismatch, the
+kind of thing that's easy to state abstractly ("match your loss to your
+metric") but easy to actually miss until a result looks wrong and gets
+investigated rather than reported as-is.
+
+### `tight_turnaround` dtype bug: NaN + Python bool silently becomes an unusable column
+
+**What happened:** training crashed immediately with
+`ValueError: pandas dtypes must be int, float or bool. Fields with bad
+pandas dtypes: tight_turnaround: object` — on the real dataset, not in
+any unit test (the test fixtures happened to always have at least one
+non-missing value in a way that didn't trigger it reliably at small
+scale).
+
+**Root cause:** `tight_turnaround` was built with
+`turnaround_minutes.where(turnaround_minutes.isna(), turnaround_minutes < 45)`
+— keep NaN where missing, else a boolean comparison. Mixing a float NaN
+with native Python `True`/`False` values in one pandas Series has no
+clean single numpy dtype, so pandas silently falls back to `object`
+dtype, which LightGBM flatly rejects.
+
+**Fix:** build it as `(turnaround_minutes < 45).astype(float)` first (a
+clean float64 column of 0.0/1.0), then `.where(turnaround_minutes.notna())`
+to punch the NaNs back in — float NaN mixed with float 0.0/1.0 stays
+float64 throughout, no object-dtype fallback.
+
+### Baseline design: an ablation of the same model, plus a naive floor
+
+Two baselines, not one: (1) the simplest possible floor — predict the
+training set's median delay for every test row, a sanity check any real
+model should clear; (2) a schedule-only LightGBM (carrier, origin, dest,
+month, day-of-week, local departure hour — no rotation/turnaround
+features), trained and evaluated identically to the full model. (2) is
+what the spec's own benchmark table means by "compare against a simple
+baseline that ignores the inbound aircraft" — using the *same algorithm*
+with a *subset of features* isolates what the rotation signal specifically
+contributes, rather than conflating it with a difference between model
+families (e.g. linear regression vs. gradient boosting would confound
+"simpler model" with "no rotation data").
+
+### Three targets, not one — matching the spec's "updated as new events arrive"
+
+Trained separately: departure delay (pre-departure features only),
+arrival delay pre-departure (schedule + rotation/turnaround, no knowledge
+of this flight's own actual departure yet), and arrival delay
+post-departure (the same features plus this flight's own now-known
+`dep_delay_min`). This mirrors how the system actually operates: before a
+flight leaves the gate, only upstream/schedule signal exists; once it has
+actually departed, its own departure delay sharpens the arrival estimate
+considerably. Measured on the real holdout: pre-departure arrival-delay
+MAE 21.41 minutes vs. post-departure 10.12 minutes — confirming this is a
+real, substantial refinement, not a redundant extra model.
+
+### Time-based holdout (last calendar month), not a random row split
+
+Train = Aug 2025-Jun 2026 (11 months), test = Jul 2026 (the most recent
+full month) — the same reasoning as Milestone 2's BTS-window decision,
+applied to model evaluation: a random row split would let the model see
+rows from the same days it's tested on (e.g. a different flight on the
+same disrupted day), which leaks same-day conditions across the split in
+a way a real deployed model, predicting forward in time, never gets. This
+also previews exactly how Milestone 4's replay backtest will evaluate —
+by date, not by row — so this milestone's numbers and Milestone 4's are
+produced by a consistent methodology, not two different ones that happen
+to both be called "accuracy."
+
+### LightGBM over alternatives (gradient boosting vs. linear/deep models)
+
+**Chose:** LightGBM, per the spec's own tech-stack table.
+
+**Why:** tabular data with a mix of categorical (carrier/origin/dest) and
+numeric (turnaround minutes, cumulative delay) features, strong
+nonlinear interactions (e.g. a tight turnaround matters far more when the
+inbound delay is already large — a multiplicative, not additive, effect)
+is exactly gradient-boosted trees' strength over linear models. Over a
+neural network: far less training data engineering (no embedding layers,
+scaling, or architecture search needed for ~7M rows of mixed tabular
+data), materially faster to train and iterate on a laptop, and — the
+feature that matters most for this project's "explain every alert with
+evidence" requirement — LightGBM exposes per-prediction feature
+contributions directly (used later by the prediction service to answer
+"why is this flight at risk," not just "how at risk"), which a black-box
+deep model would need a separate explainability layer (SHAP, etc.) bolted
+on to match.
+
+### LightGBM on macOS without Homebrew: borrow scikit-learn's bundled `libomp`
+
+**What happened:** `import lightgbm` crashed with `Library not loaded:
+@rpath/libomp.dylib`, searching only Homebrew (`/opt/homebrew/opt/libomp`)
+and MacPorts (`/opt/local/lib/libomp`) paths — neither of which exist,
+and Homebrew is off-limits for this project.
+
+**Chose:** point the dynamic linker at scikit-learn's own bundled
+`libomp.dylib` (`sklearn/.dylibs/libomp.dylib` — confirmed ABI-compatible:
+both report OpenMP compatibility version 5.0.0) via `DYLD_LIBRARY_PATH`,
+rather than downloading or installing anything new. `make train-model`
+resolves this path dynamically from the active venv's installed
+scikit-learn rather than hardcoding a Python-version-specific path, so it
+keeps working across a `venv` rebuild.
+
+**Why:** this is precisely the "install tooling user-locally, not via
+Homebrew" instruction applied to a dependency conflict rather than a
+missing tool — the runtime library already exists on disk (pip installed
+it as part of scikit-learn's wheel), it just wasn't where LightGBM's
+hardcoded rpath looked for it. No new download, no modification to any
+installed package's files, fully reversible (unset one environment
+variable).

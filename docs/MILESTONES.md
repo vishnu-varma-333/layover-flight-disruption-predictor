@@ -9,7 +9,7 @@ planned).
       PostgreSQL with TimescaleDB, Redis, observability.
 - [x] **2. Historical data** — Download and clean US on-time records into
       Parquet; build rotation history from tail numbers.
-- [ ] **3. Baseline and model** — A simple baseline, then the LightGBM model
+- [x] **3. Baseline and model** — A simple baseline, then the LightGBM model
       with rotation, turnaround and airport features; tracked in MLflow.
 - [ ] **4. Backtesting harness** — Replay historical days through Kafka and
       measure lead time and accuracy. First headline numbers.
@@ -212,3 +212,99 @@ auditable, never silent.
 - Deferred nothing in this milestone's own scope. The 12-month window
   (vs. "all years" of BTS history) is a documented, reversible scope
   choice — see DECISIONS.md — not a dropped requirement.
+
+## Milestone 3 — Baseline and model
+
+**Goal:** turn the Milestone 2 Flight/Rotation data into a feature table,
+and prove the central hypothesis of this whole project — that tracking
+the inbound aircraft meaningfully improves delay prediction over a
+schedule-only model — with a real, controlled comparison on real data,
+not an assumed result.
+
+### What was built
+
+- `src/layover_model/features.py` — one feature table covering schedule
+  features (carrier, origin, dest, local departure hour/day-of-week/
+  month) and rotation/turnaround features (previous-leg delay, turnaround
+  minutes, a tight-turnaround flag, chain-break flag, cumulative same-day
+  delay), all computed with vectorized pandas groupby/shift/cumsum —
+  deliberately, learning from Milestone 2's rotation-building performance
+  bug, never a per-row or per-tiny-group Python loop.
+- A short literature pass (see DECISIONS.md) before finalizing the
+  feature set, which directly added two features (`tight_turnaround`,
+  `cum_delay_today`) the original design hadn't included, and produced a
+  deliberate, documented decision to *not* build graph-based airport-
+  centrality features or meta-models for v1.
+- `scripts/train_model.py` — trains three LightGBM models (departure
+  delay; arrival delay pre-departure; arrival delay post-departure, once
+  this flight's own departure delay is known — matching the spec's
+  "updated as new events arrive"), each logged to MLflow with params and
+  metrics. The headline arrival-delay model is additionally compared
+  against a schedule-only ablation of the *same* algorithm (isolating the
+  rotation signal's own contribution) and a naive median-delay floor.
+- A strict time-based holdout (train on Aug 2025-Jun 2026, test on Jul
+  2026) rather than a random row split — avoiding same-day leakage across
+  train/test and previewing Milestone 4's by-date replay methodology.
+- 7 unit tests on synthetic fixtures covering local-hour correctness
+  (pinned against Python's own `zoneinfo`), no-leakage rotation shifting,
+  chain-break detection, the tight-turnaround threshold, and cumulative
+  same-day delay.
+
+### Bugs and a methodology error found during live verification
+
+**Bug 1 — environment: LightGBM can't load on macOS without Homebrew.**
+`import lightgbm` failed looking for `libomp.dylib` only at Homebrew/
+MacPorts paths. Fixed by pointing `DYLD_LIBRARY_PATH` at scikit-learn's
+own bundled (and ABI-compatible) copy instead of installing anything new
+— `make train-model` resolves this automatically. Full writeup in
+DECISIONS.md.
+
+**Bug 2 — `tight_turnaround` became an unusable `object`-dtype column.**
+Mixing float NaN with Python `bool` values in one pandas Series silently
+produces `object` dtype, which LightGBM rejects outright. Fixed by
+keeping the column float64 throughout (0.0/1.0/NaN) instead of NaN mixed
+with real booleans.
+
+**Methodology error — L2 objective vs. an MAE metric.** The schedule-only
+ablation model scored *worse* than a naive median baseline under
+LightGBM's default objective — a red flag, since the median is the best
+possible constant predictor specifically under MAE. Diagnosed as an
+objective/metric mismatch (L2 targets the mean; delay is right-skewed, so
+the mean overshoots on the many near-zero-delay flights) rather than
+patched over or reported as-is. Switching every model to `regression_l1`
+fixed it: the schedule-only model then correctly beat the naive floor,
+and the ablation margin became trustworthy. Full writeup in DECISIONS.md
+— this is the kind of check the user explicitly asked be done thoroughly
+for feature engineering and modeling decisions, not rushed.
+
+### Results (real holdout, Jul 2026, 612,038 test flights)
+
+| Model | Naive median MAE | Schedule-only MAE | Full (rotation) MAE |
+| --- | --- | --- | --- |
+| Departure delay | 26.95 min | — | **15.55 min** |
+| Arrival delay, pre-departure | 31.36 min | 29.82 min | **21.41 min** (28.2% better than schedule-only) |
+| Arrival delay, post-departure | 31.36 min | — | **10.12 min** |
+
+The headline number: tracking the inbound aircraft's rotation cuts
+arrival-delay prediction error by **28.2%** versus a schedule-only model
+of the identical algorithm, trained and evaluated identically — isolating
+the value of this project's core idea, not just showing a model beats a
+weak strawman. Once a flight has actually departed, the arrival-delay
+estimate sharpens further (21.41 -> 10.12 minutes), confirming the
+"updated as new events arrive" design is working as intended.
+
+### Progress notes
+
+- Full pipeline (load 7,043,858-row feature table + train/eval/log 4
+  LightGBM models) runs in ~7.5 minutes on this machine — ~23s for
+  feature engineering, ~7 minutes for training and MLflow logging. Real
+  numbers and methodology in docs/BENCHMARKS.md.
+- Lint and all 29 unit tests (22 from Milestone 2 + 7 new) pass clean.
+- Deferred, by deliberate and documented decision, not oversight: graph-
+  based airport-centrality features and meta-models (considered during
+  the literature pass, scoped out of v1 — see DECISIONS.md); hyperparameter
+  tuning (reasonable defaults used, formal tuning not required by the
+  spec for this milestone). Real airport-condition features (live
+  weather/FAA status) remain blocked on Milestone 5's ingestion, per the
+  spec's own milestone order — not a skipped requirement, a sequencing
+  dependency.
