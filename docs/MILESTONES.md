@@ -17,7 +17,7 @@ planned).
       with credit budgeting.
 - [x] **6. Stream processing** — Flink jobs for event-time handling,
       rotation linking and feature updates.
-- [ ] **7. Prediction service** — FastAPI serving risk and explanations
+- [x] **7. Prediction service** — FastAPI serving risk and explanations
       from online features.
 - [ ] **8. Trip monitoring and alerts** — Temporal workflows, deduplicated
       push and email alerts, kill tests.
@@ -599,3 +599,96 @@ regression), in DECISIONS.md.
   not a shortcut that went unmentioned; the simpler watermark-plus-last-
   write-wins design correctly handles every messiness category this
   milestone actually tests, confirmed live.
+
+## Milestone 7 — Prediction service
+
+**Goal:** serve each flight's current predicted delay and an
+evidence-backed explanation from the online feature state Milestone 6's
+real Flink job produces — a genuine FastAPI service reading a real
+Redis-backed feature store, not a stub.
+
+### A research pass that found real correctness problems before any service code was written
+
+Tracing whether `stream.flight_features` actually carried the full
+training feature schema (SCHEDULE_FEATURES + ROTATION_FEATURES) — the
+first step, per the standing instruction to research feature-engineering
+work properly rather than start coding — found it didn't: 8 of 14
+required fields were missing entirely, `turnaround_minutes` was measured
+from the wrong timestamp, and (found by switching Milestone 6's ground
+truth to Milestone 4's independently-validated `BacktestScorer`) that
+scorer itself had a real `leg_index` bug live since Milestone 4. All
+three fixed, with Milestone 4's backtest and Milestone 6's verification
+both re-run to get corrected real numbers. Full writeup in DECISIONS.md;
+the corrected numbers are reflected in Milestones 4 and 6 above and in
+docs/BENCHMARKS.md.
+
+### What was built
+
+- `src/layover_predict/feature_store.py` — the Redis-backed online
+  feature store: one JSON record per flight, 48h TTL, keyed for O(1)
+  lookup.
+- `scripts/sync_features_to_redis.py` — a dedicated Kafka consumer
+  syncing `stream.flight_features` into Redis, deliberately separate
+  from the Flink job itself (see DECISIONS.md for why).
+- `src/layover_predict/service.py` — the FastAPI service
+  (`GET /flights/{flight_id}/risk`): looks up a flight's latest online
+  features, picks the pre- or post-departure model based on whether its
+  own departure delay is known yet (mirroring Milestone 3's own model
+  design), serves the real trained LightGBM model from MLflow, and
+  returns `predicted_delay` plus an evidence-backed `explanation`.
+  `p_miss` is returned null — it needs a `TripLeg` with a minimum
+  connection time that doesn't exist until Milestone 8, the same
+  sequencing gap Milestone 4 already named, not a dropped requirement.
+- `src/layover_predict/explain.py` — turns LightGBM's native
+  `pred_contrib` (exact, TreeSHAP-consistent per-prediction feature
+  attribution — the tech-stack table's own stated reason for choosing
+  LightGBM) into ranked, evidence-backed sentences ("inbound aircraft's
+  previous leg landed 107 min late"), not a generic feature-importance
+  ranking or an LLM-generated explanation.
+- `src/layover_backtest/scorer.py` — gained a `prepare_frame` helper
+  (the DataFrame construction and dtype coercion already inside
+  `score_requests`, factored out) so the prediction service reuses the
+  exact same, already-tested categorical/numeric handling Milestone 4
+  validated, rather than a second implementation of it.
+- `scripts/verify_prediction_service.py` — live checks against the real
+  running service: every sampled real flight gets a valid, non-empty
+  explanation, and one flight's prediction is independently re-derived
+  (same Redis record, same MLflow model, no HTTP layer) and checked
+  against the service's own HTTP response.
+- 7 new unit tests for `explain.py`'s ranking and sentence logic
+  (synthetic rows/contributions, no Redis or MLflow needed).
+
+### Bugs found during live verification (two, both fixed)
+
+1. `prepare_frame` assumed every request dict always carries a
+   `dep_delay_min` key (true of `BacktestScorer`'s own feature dicts,
+   not of the Flink job's pre-departure-stage records) — raised a
+   `KeyError` the first time a flight that hadn't departed yet was
+   queried. Fixed by filling the key in explicitly before scoring.
+2. A genuinely very-late inbound aircraft can push `turnaround_minutes`
+   negative (its landing is already past this flight's own scheduled
+   departure) — read as a reassuring "a tight turnaround" instead of
+   what it actually is. Fixed with an explicit negative-value case in
+   the explanation text.
+
+Full root-cause writeups for both, and for the three research-pass bugs
+above, in DECISIONS.md.
+
+### Results (same 2026-07-15 demo day, 19,746 flights)
+
+- All 77,380 real Flink feature updates synced to Redis in a single
+  20-second bounded run, converging to 19,746 distinct keys.
+- Every one of 15 real sampled flights returned a valid risk assessment
+  with a non-empty, evidence-backed explanation over HTTP.
+- Prediction endpoint latency (200 real flights, Redis lookup + feature
+  assembly + model inference + `pred_contrib`, end to end): **p50
+  9.5ms, p95 13.9ms, p99 19.2ms**.
+- A live cross-check: one flight's prediction, re-derived independently
+  with no HTTP layer, matched the service's own HTTP response exactly.
+
+### Progress notes
+
+- Lint and all 77 unit tests (70 from Milestones 1–6 + 7 new) pass clean.
+- Deferred nothing in this milestone's own scope. `p_miss` is a named
+  sequencing dependency on Milestone 8's `TripLeg` entity, exactly like
+  Milestone 4's identical gap — not a dropped requirement.

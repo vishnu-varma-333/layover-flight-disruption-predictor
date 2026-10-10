@@ -392,3 +392,45 @@ occasionally reordering two of the same tail's schedule events relative
 to each other (unlike the other rotation fields, `leg_index`'s true
 value is inherently order-of-schedule-arrival dependent, so this residual
 is expected, not a bug).
+
+## Milestone 7 — Prediction service
+
+### Setup
+
+`make sync-features && make predict-service && make verify-predict`,
+2026-10-10, against the real Milestone 6 output for the same demo day
+(2026-07-15), a real Redis instance (Milestone 1's stack), and the real
+trained LightGBM models loaded from MLflow — no mocks.
+
+### Feature sync (Flink output -> Redis)
+
+| Metric | Value |
+| --- | --- |
+| Feature updates consumed | 77,380 |
+| Distinct flights synced | 19,746 (matches Milestone 6's own Flink output exactly) |
+| Wall-clock time | 20s (bounded run) |
+
+### Prediction endpoint latency (200 real flights, after one warm-up request)
+
+End to end: Redis lookup, feature-frame assembly (categorical/numeric
+coercion), model inference, and `pred_contrib` explanation attribution.
+
+| Percentile | Latency |
+| --- | --- |
+| p50 | 9.5ms |
+| p95 | 13.9ms |
+| p99 | 19.2ms |
+| max | 65.4ms |
+
+Comfortably inside the spec's "p95 under a few seconds" end-to-end
+target, which also has to cover ingestion and stream processing
+upstream of this service, not just this hop.
+
+### Live correctness check
+
+15/15 real sampled flights returned a valid risk assessment (numeric
+`predicted_delay`, non-empty evidence-backed `explanation`) over HTTP.
+A cross-check re-derived one flight's prediction independently — same
+Redis record, same MLflow model, no HTTP layer involved — and it
+matched the service's own HTTP response exactly, confirming the
+response is the real model's real output, not a well-shaped stub.

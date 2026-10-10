@@ -1,4 +1,4 @@
-.PHONY: up down logs verify lint test fetch-data build-data verify-data train-model backtest live-ingest verify-live rotation-produce rotation-job rotation-verify
+.PHONY: up down logs verify lint test fetch-data build-data verify-data train-model backtest live-ingest verify-live rotation-produce rotation-job rotation-verify sync-features predict-service verify-predict
 
 # LightGBM's macOS wheel needs the libomp OpenMP runtime, which it expects
 # at a Homebrew path this project deliberately doesn't use. scikit-learn's
@@ -60,3 +60,12 @@ rotation-job:
 
 rotation-verify:
 	.venv/bin/python scripts/verify_rotation_job.py
+
+sync-features:
+	.venv/bin/python scripts/sync_features_to_redis.py --duration 20
+
+predict-service:
+	DYLD_LIBRARY_PATH="$(LIBOMP_DIR)" .venv/bin/python -m uvicorn layover_predict.service:app --app-dir src --port 8000
+
+verify-predict:
+	DYLD_LIBRARY_PATH="$(LIBOMP_DIR)" .venv/bin/python scripts/verify_prediction_service.py

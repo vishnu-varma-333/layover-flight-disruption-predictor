@@ -1174,3 +1174,113 @@ schema (not just the original 6) and the fixes above, moved from 95.8%
 match on a narrower, partly-wrong comparison to **92.7% match on the
 full, correct schema** -- a lower headline number than before, but a
 more trustworthy one, and the right one to build Milestone 7 on.
+
+### Online feature store: a dedicated Redis-syncing consumer, not a Flink sink
+
+The spec names Redis as the "online feature state" layer ("latest
+aircraft and airport state for low-latency predictions"). Two ways to
+get Milestone 6's Flink output into it: have the Flink job write to
+Redis directly (a custom sink inside `rotation_job.py`), or add a small,
+separate Kafka consumer that reads `stream.flight_features` and upserts
+into Redis. Chose the separate consumer (`scripts/sync_features_to_redis.py`):
+
+- The Flink job is already the most complex, hardest-to-debug component
+  in this project (watermarks, keyed state, a Python UDF subprocess,
+  JVM/connector setup). Adding a stateful Redis client inside it couples
+  two different failure domains (stream processing correctness and
+  online-store availability) for no benefit -- a Redis outage shouldn't
+  risk the rotation-linking job's own checkpointing, and a plain
+  consumer can be restarted or scaled independently.
+- Kafka already gives this exactly the delivery guarantee it needs:
+  `stream.flight_features` is the durable log; a consumer group offset
+  is how the sync step tracks what it's applied, the same pattern this
+  project already uses everywhere else (the backtest scorer, the
+  rotation job itself).
+
+A fixed TTL (48h) on every Redis key, not a separate cleanup job: a
+flight's online features stop mattering long before that, so an unused
+key disappearing on its own is simpler than tracking deletion.
+
+### Model selection: dep_delay_min's presence, not a separate model-version field
+
+The online feature record doesn't carry an explicit "which model should
+score this" flag -- the service infers it the same way
+`layover_backtest.scorer.MODEL_FEATURE_COLS` already implies it: a
+record with a known `dep_delay_min` came from (or was re-scored after)
+this flight's own "departed" event, so the post-departure model (which
+was trained with that as an extra feature) is strictly more informed
+and should be used; otherwise the pre-departure rotation model serves
+it. This mirrors Milestone 3's own three-model design ("updated as new
+events arrive") without introducing a new field.
+
+### Explanations: real LightGBM `pred_contrib`, not a feature-importance heatmap or an LLM
+
+The tech-stack table's own stated reason for choosing LightGBM is
+"interpretable feature contributions for explanations" -- `pred_contrib`
+gives an exact, TreeSHAP-consistent decomposition of *this specific
+prediction* into each input feature's contribution, which is what makes
+an explanation like "inbound aircraft landed 107 min late" true of this
+flight specifically, not a generic "this feature matters on average"
+statement (a global feature-importance ranking would say the same thing
+for every flight and miss the point). Deliberately not routed through
+an LLM to turn numbers into prose: the sentence templates in
+`explain.py` are a direct, auditable mapping from a real number to a
+real sentence, with no risk of a model inventing a plausible-sounding
+but wrong reason -- appropriate for a safety-adjacent "why should I
+trust this delay prediction" answer.
+
+Sentences are ranked by each prediction's own contribution magnitude
+(largest first, top 3), not a fixed priority order -- the same flight's
+dominant evidence changes by stage (its own departure delay dominates
+once it's departed; the inbound aircraft's delay and turnaround dominate
+before that), which a fixed order would misrepresent.
+
+### `p_miss` left null, not fabricated -- the same sequencing gap Milestone 4 already named
+
+`RiskAssessment.p_miss` only means something relative to a connection's
+minimum connection time, which lives on `TripLeg` -- an entity the spec
+itself doesn't introduce until Milestone 8 (Trip monitoring and alerts).
+Milestone 4 already hit this exact gap ("connection-risk probability...
+needs a Trip/TripLeg entity that doesn't exist yet") and named it a
+sequencing dependency, not a dropped requirement; this service follows
+the same precedent rather than inventing a placeholder probability that
+would look real but mean nothing.
+
+### Bugs found live, building and verifying the actual service
+
+1. **`prepare_frame` assumed every request dict always carries a
+   `dep_delay_min` key.** True for `BacktestScorer`'s own feature dicts
+   (always present, possibly `None`), but the Flink job only ever sets
+   it on the "departed"-stage record -- a real flight's "schedule"- or
+   "landed"-stage online feature record simply doesn't have the key at
+   all. `df[NUMERIC_COLS]` raised `KeyError` the first time a
+   pre-departure flight was queried. Fixed in the service (and the
+   verification script's cross-check) by filling the key in explicitly
+   before calling `prepare_frame`, rather than changing the Flink job's
+   own output schema for one consumer's column-selection requirement.
+2. **A negative `turnaround_minutes` read as a reassuring "tight
+   turnaround."** A genuinely very-late inbound aircraft can push this
+   value negative (its actual landing is already past this flight's own
+   scheduled departure) -- training's `tight_turnaround = (turnaround <
+   45 min)` is still technically `True` there, but "a tight turnaround"
+   undersells what's actually an overdue aircraft, and the generic
+   minutes formatter's `abs()` hid the sign entirely (e.g. "turnaround
+   is 463 min -- a tight turnaround" instead of "already overdue by
+   463 min"). Found by deliberately looking at a real flight with a
+   large inbound delay, not assumed. Fixed with an explicit negative-
+   value branch in `explain.py`'s turnaround explainer.
+
+### Real numbers (2026-07-15 demo day, 19,746 flights synced to Redis)
+
+- Feature sync: all 77,380 Flink feature updates consumed and upserted
+  in a single 20-second bounded run, converging to 19,746 distinct keys
+  (matching the Flink job's own output -- see Milestone 6).
+- Prediction endpoint latency, 200 real flights after a warm-up request
+  (Redis lookup + feature assembly + model inference +
+  `pred_contrib`, end to end): **p50 9.5ms, p95 13.9ms, p99 19.2ms**
+  -- comfortably inside the spec's "p95 under a few seconds"
+  end-to-end target, which also has to cover ingestion and stream
+  processing upstream of this service.
+- Live cross-check: a flight's prediction re-derived independently (same
+  Redis record, same MLflow model, no HTTP layer) matched the service's
+  own HTTP response exactly.

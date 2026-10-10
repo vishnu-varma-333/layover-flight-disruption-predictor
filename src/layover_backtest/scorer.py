@@ -244,6 +244,25 @@ class BacktestScorer:
         raise ValueError(f"unknown event_type {etype!r}")
 
 
+def prepare_frame(requests: list, categories: dict) -> pd.DataFrame:
+    """The DataFrame construction and dtype coercion every request dict
+    (from `BacktestScorer.handle_event`, or Milestone 7's online feature
+    records, which share the same field names) needs before a model can
+    score it: categorical columns pinned to the fixed Milestone 3
+    training-time category lists (so a small batch -- as small as one
+    row, at serving time -- never silently narrows a column's
+    categories), numeric columns coerced so an all-missing column
+    doesn't come in as object dtype.
+
+    `categories`: {"carrier": [...], "origin": [...], "dest": [...]}.
+    """
+    df = pd.DataFrame(requests)
+    for col in CATEGORICAL_COLS:
+        df[col] = pd.Categorical(df[col], categories=categories[col])
+    df[NUMERIC_COLS] = df[NUMERIC_COLS].apply(pd.to_numeric, errors="coerce")
+    return df
+
+
 def score_requests(requests: list, models: dict, categories: dict) -> pd.DataFrame:
     """Batches every accumulated request by model and predicts once per
     batch. All DataFrame construction and dtype coercion happens here,
@@ -257,10 +276,7 @@ def score_requests(requests: list, models: dict, categories: dict) -> pd.DataFra
     if not requests:
         return pd.DataFrame(columns=["flight_id", "event_time", "model", "predicted_delay"])
 
-    df = pd.DataFrame(requests)
-    for col in CATEGORICAL_COLS:
-        df[col] = pd.Categorical(df[col], categories=categories[col])
-    df[NUMERIC_COLS] = df[NUMERIC_COLS].apply(pd.to_numeric, errors="coerce")
+    df = prepare_frame(requests, categories)
 
     results = []
     for model_name, group in df.groupby("model"):
