@@ -616,3 +616,162 @@ it as part of scikit-learn's wheel), it just wasn't where LightGBM's
 hardcoded rpath looked for it. No new download, no modification to any
 installed package's files, fully reversible (unset one environment
 variable).
+
+## Milestone 4 — Backtesting harness
+
+### Research pass: point-in-time correctness and early-warning evaluation practice
+
+Before designing the replay, searched for how streaming ML systems
+actually handle backtesting and how early-warning systems are properly
+evaluated, rather than inventing a methodology from scratch:
+
+- **Point-in-time correctness**: a training/evaluation sample for an
+  event at time t must only use feature values known at or before t;
+  replay must advance chronologically and never let a later observation
+  rewrite an earlier prediction snapshot. This directly shaped the
+  event-driven design (below) rather than reusing Milestone 3's batch
+  feature table for replay, which would have been leaky by construction
+  (batch mode's `prev_arr_delay_min` always uses the eventual actual
+  outcome, regardless of whether that outcome would genuinely be known
+  yet relative to the current flight's own schedule).
+- **Early Warning Recall / Mean-Time-to-Alert**: lead time must be
+  reported *alongside* detection recall, never alone — a system can have
+  an impressive median lead time while still missing most real events,
+  which lead time by itself hides. This directly caught a real
+  presentation trap in this project's own results (see below).
+
+### Replay architecture: one Kafka topic, three event types, producer-sorted
+
+Three event types per flight -- "schedule" (simulated 24h before
+`sched_dep_utc`; BTS gives no real schedule-publish time, and the offset
+doesn't affect the rotation-driven lead time this milestone measures,
+since that's governed by the *inbound* aircraft's real "landed" event),
+"departed" (this flight's own actual departure), "landed" (this flight's
+own actual arrival — simultaneously the ground-truth label for this
+flight and the rotation information the *next* flight on the same tail
+needs). All three flow through a single Kafka topic/partition, with the
+producer emitting them in sorted event-time order.
+
+**Why single-partition, producer-sorted, not Flink-style watermarking:**
+a live system (Milestone 6) must handle genuinely out-of-order,
+multi-source arrival with real watermarks — that's explicitly Flink's job
+later. This is a *backtest*, replaying known history: the producer
+controls emission order because it already has the full timeline, so
+single-partition sorted order is sufficient and correct here specifically.
+Documented as a deliberate scope boundary, not a shortcut that got missed.
+
+### Feature capture and model inference are deliberately decoupled, and `handle_event` never touches pandas
+
+The scorer's state machine (per-tail rotation tracking, pending-flight
+bookkeeping) runs in plain Python dicts; it returns *unscored* requests,
+and a separate `score_requests` batches every accumulated request by
+model before calling `predict()` once per model. This was not the first
+design — seeing why it had to change is itself the finding (see Bugs 2-3
+below).
+
+### Bugs found during live verification (six, across two full-month run attempts)
+
+**Bug 1 — Kafka producer `BufferError: Queue full`.** Producing ~1.86M
+events in a tight loop without ever calling `producer.poll(0)` let
+librdkafka's local outstanding-message queue (default cap 100,000) fill
+up mid-run. Fixed by polling non-blockingly after every `produce()` call,
+the standard confluent-kafka high-throughput pattern.
+
+**Bug 2 — single-row `model.predict()` costs ~2.6ms purely from fixed
+per-call overhead.** Profiled directly rather than assumed: 500 individual
+single-row `predict()` calls took 1.32s total; one 500-row batched call
+took 0.0057s — ~240x faster per row, confirming the cost is fixed
+per-call overhead (thread dispatch, data validation), not actual
+computation. At this project's event volumes (hundreds of thousands to
+low millions of predict calls for a full month), scoring inline inside
+`handle_event` meant a 2-day pilot alone took 15+ minutes with no
+end in sight. Fixed by decoupling capture from inference (see above):
+`handle_event` returns requests, `score_requests` batches them by model
+at the end. Correctness is unaffected because a prediction's value never
+feeds back into the state machine — only real ground-truth events do.
+
+**Bug 3 — building even a single-row DataFrame costs ~2.4ms per call, the
+same order of overhead as Bug 2, for the same underlying reason.**
+Profiled directly: even after fixing Bug 2, a 2-day pilot still took 11+
+minutes with climbing memory. Isolated the remaining cost to
+`_feature_row`'s per-call DataFrame construction plus categorical/numeric
+dtype coercion — pandas is built for one bulk vectorized operation, not
+tens of thousands of tiny ones, a direct echo of Milestone 2's rotation-
+building bug in a different spot. Fixed by having `handle_event` return a
+*plain Python dict* of raw feature values (measured: ~0.0014ms/call, a
+~1700x improvement) and moving all DataFrame construction and dtype
+coercion into `score_requests`, run exactly once over every accumulated
+request. Combined with Bug 2's fix, the 2-day pilot dropped from 11+
+minutes (not finished) to 90 seconds.
+
+**Bug 4 — `.values` on a timezone-aware column silently returns
+timezone-*naive* numpy `datetime64`.** After fixing Bugs 2-3, the first
+full pilot run crashed computing lead time:
+`TypeError: Cannot subtract tz-naive and tz-aware datetime-like objects`.
+Root cause: `score_requests`'s result construction used
+`group["event_time"].values` to build the output DataFrame — a
+well-known pandas gotcha where `.values` on tz-aware data strips the
+timezone entirely, producing a naive column that can no longer be
+compared against the (still tz-aware) ground-truth timestamps. Fixed by
+building the result from the group's own tz-aware Series
+(`group[["flight_id","event_time"]]`) rather than round-tripping through
+raw numpy arrays.
+
+**Bug 5 — the real dominant cost at full-month scale: an O(n) scan over
+a silently-growing "pending" dict.** Even after Bugs 2-4 were fixed, the
+first full-month attempt only consumed 400,404 of 1,859,448 events in
+600 seconds and silently timed out (see Bug 6). Diagnosed analytically
+before re-running: cancelled flights are added to `pending` at their
+"schedule" event but never removed (no "departed" event ever fires for a
+flight that never departed), so they leaked into the dict for the rest
+of the replay — a few hundred by a 2-day pilot's end (harmless), but
+thousands by a full month's end. The "landed" handler scanned *all* of
+`pending` on every one of ~600K landed events, filtering for the matching
+tail/date -- back-of-envelope, ~600,000 events x an average few thousand
+leaked entries x per-comparison overhead lands squarely in the observed
+slowdown. Fixed two ways: cancelled flights are never added to `pending`
+at all (added "cancelled" to the event schema so the scorer can check at
+schedule-event time), and `pending` is now keyed by `(tail_number,
+fl_date)` so a landed event's re-score lookup is O(flights on that tail
+that day) — typically 0-2 — never O(every pending flight in the replay).
+Measured result: full-month consumer throughput went from 667 events/sec
+(timing out) to **14,338 events/sec** — a ~21x improvement — finishing in
+130 seconds.
+
+**Bug 6 — an incomplete consume was reported as if it were a final
+result.** The original code logged a `WARNING` when the consumer hit its
+timeout short of `n_events`, then proceeded to compute and print "final"
+metrics anyway, using ground truth from the *full* month but predictions
+from only the ~21.5% of events actually processed. This made recall look
+catastrophically wrong (13.2%) in a way that read as a genuine finding
+rather than a broken run — until the MAE cross-check's `n=145,623` (not
+the expected 612,038) gave it away. Fixed by raising a hard `SystemExit`
+on an incomplete consume instead of a warning: a partial replay must
+never silently produce a number that looks like a complete one.
+
+### A result that needed its own caveat, caught by the research pass above
+
+`schedule_only`'s "lead time" (median 1,440 minutes = exactly 24 hours,
+every time) is a simulation artifact, not a real signal: that model is
+scored exactly once, at its single simulated "schedule known" event, so
+*any* detection it makes trivially shows the full 24h offset as its lead
+time. Reported side-by-side with `rotation`'s lead time without comment,
+this would misleadingly suggest schedule-only has a *longer* lead time
+than the rotation model. The number that actually matters is recall:
+schedule-only catches 11.0% of real 15+-minute delays; the rotation model
+catches 66.0% overall and 74.9% of flights that have any inbound aircraft
+to track at all. This is precisely the "lead time without recall" pitfall
+the early-warning-evaluation research (above) warned about, applied to
+this project's own numbers before they were reported as final.
+
+### Segmented, not just averaged: first-leg-of-day vs. later legs
+
+Reported recall and lead time separately for flights with no possible
+rotation signal (`leg_index == 0`, the first flight of the tail's day —
+5.9% recall, nothing to track) vs. flights with a trackable inbound
+aircraft (`leg_index > 0` — 74.9% recall, 232-minute median lead time).
+Averaging these together would understate the system's real value where
+it actually applies, and overstate it where it structurally can't (a
+first leg has no inbound aircraft, by definition, no matter how good the
+model is). Honest segmentation beats a single flattering-but-misleading
+average.

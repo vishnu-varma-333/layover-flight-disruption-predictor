@@ -210,3 +210,58 @@ floor, as any real model should), and the full arrival-delay model also
 improved (22.82 -> 21.41). Both L2 and L1 numbers are included here
 because the difference, and *why* it happened, is itself a real finding —
 not because the L2 numbers are a valid benchmark to compare against.
+
+## Milestone 4 — Backtesting harness
+
+### Setup (applies to every number in this section)
+
+`scripts/run_backtest.py`, 2026-10-10, replaying the real July 2026 test
+month (631,970 flights, 1,859,448 events) through the actual Redpanda
+stack from Milestone 1, scoring with the exact trained models from
+Milestone 3 (loaded from MLflow). Same machine as all prior benchmarks.
+
+### Performance: before and after the per-call overhead fixes
+
+| Stage | Throughput / time |
+| --- | --- |
+| Event stream construction (1,859,448 events) | 1.5s |
+| Kafka produce (1,859,448 events) | 35.6s |
+| Consume + score, **before** fixes (inline single-row predict + per-event DataFrame construction) | timed out at 600s, only 400,404/1,859,448 events (667 events/sec effective) |
+| Consume + score, **after** decoupling inference + plain-dict feature capture, **before** the pending-state fix | n/a at full-month scale (diagnosed analytically before re-running — see DECISIONS.md) |
+| Consume + score, **after all fixes** | **129.7s for all 1,859,448 events (14,338 events/sec)** |
+
+**Isolated micro-benchmarks** (profiled directly, not estimated):
+- Single-row `model.predict()`: ~2.64ms/call. Batched (500 rows in one call): ~0.011ms/row (~240x faster per row).
+- Single-row feature `DataFrame` construction + dtype coercion: ~2.44ms/call. Plain Python dict construction (same data): ~0.0014ms/call (~1700x faster).
+- Net effect of all fixes combined: full-month replay went from "does not finish in 10 minutes" to 130 seconds.
+
+### Headline numbers (real replay, July 2026, 631,970 flights)
+
+| Metric | Rotation model | Schedule-only model |
+| --- | --- | --- |
+| Detection recall (15+ min delay, overall) | 66.0% (114,500/173,461) | 11.0% (18,994/173,461) |
+| Median lead time, detected only | 232.0 min | 1,440.0 min (simulation artifact — see DECISIONS.md) |
+| Mean lead time, detected only | 623.3 min | 1,440.0 min |
+| Recall, flights with any inbound aircraft (leg_index > 0) | **74.9%** (n=151,202) | — |
+| Recall, first leg of the day (leg_index == 0, no rotation signal possible) | 5.9% (n=22,259) | — |
+
+### MAE cross-check: this replay vs. Milestone 3's offline evaluation
+
+| Model | Milestone 3 (offline, sklearn-style) | Milestone 4 (this replay, event-driven) |
+| --- | --- | --- |
+| Schedule-only | 29.82 | 29.82 (exact match) |
+| Rotation (arrival, pre-departure) | 21.41 | 22.09 |
+| Post-departure | 10.12 | 10.14 |
+
+All three evaluated on identical n=612,038 (non-cancelled, non-diverted,
+known-outcome flights in July 2026) in both methodologies. The exact
+match for schedule-only and near-exact match for post-departure validate
+that the replay harness correctly reproduces Milestone 3's model
+behavior end to end (Kafka transport, event parsing, categorical
+encoding, model loading — all independently exercised here). The small
+rotation-model gap (22.09 vs. 21.41) is expected, not a bug: this replay
+enforces point-in-time correctness strictly (a flight only sees its
+inbound leg's outcome if that leg has *actually landed* by the time of
+scoring), while Milestone 3's batch feature table always uses the
+eventual actual outcome regardless of whether it would genuinely be known
+yet — a small, rare look-ahead this replay deliberately does not have.

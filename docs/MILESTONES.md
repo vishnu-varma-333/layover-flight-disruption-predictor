@@ -11,7 +11,7 @@ planned).
       Parquet; build rotation history from tail numbers.
 - [x] **3. Baseline and model** — A simple baseline, then the LightGBM model
       with rotation, turnaround and airport features; tracked in MLflow.
-- [ ] **4. Backtesting harness** — Replay historical days through Kafka and
+- [x] **4. Backtesting harness** — Replay historical days through Kafka and
       measure lead time and accuracy. First headline numbers.
 - [ ] **5. Live ingestion** — OpenSky, weather and airport-status ingestors
       with credit budgeting.
@@ -308,3 +308,102 @@ estimate sharpens further (21.41 -> 10.12 minutes), confirming the
   weather/FAA status) remain blocked on Milestone 5's ingestion, per the
   spec's own milestone order — not a skipped requirement, a sequencing
   dependency.
+
+## Milestone 4 — Backtesting harness
+
+**Goal:** replay a real month of flights through the actual Kafka
+infrastructure from Milestone 1 — event by event, in the order
+information genuinely becomes available — scoring each flight with the
+Milestone 3 models as that information arrives, and measure the headline
+numbers: warning lead time and detection recall.
+
+### What was built
+
+- `src/layover_backtest/events.py` — turns Flight records into three
+  event types per flight (schedule known, departed, landed), each
+  carrying only what's genuinely known at that moment; globally sorted by
+  event time for producer-side, single-partition chronological replay.
+- `src/layover_backtest/scorer.py` — a stateful, point-in-time-correct
+  scorer: per-tail rotation state built incrementally from events (never
+  from the already-computed, and therefore leaky, Milestone 3 batch
+  feature table), re-scoring the next scheduled leg the instant its
+  inbound aircraft lands. Feature capture and model inference are
+  deliberately decoupled for performance (see Bugs below).
+- `src/layover_backtest/metrics.py` — lead time and detection recall
+  (reported together, per early-warning-evaluation research — see
+  DECISIONS.md), segmented by whether a flight had any inbound rotation
+  signal at all, plus an MAE cross-check against Milestone 3's offline
+  evaluation using the identical trained models.
+- `scripts/run_backtest.py` — orchestrates: loads the three Milestone 3
+  models from MLflow, builds the event stream, produces it to Redpanda,
+  consumes and scores it, computes and prints every metric.
+- A research pass (point-in-time correctness principles; early-warning
+  recall/lead-time evaluation practice) done before designing the replay,
+  not after something looked wrong — see DECISIONS.md.
+- 11 new unit tests (plain-dict event stream construction, the scorer's
+  state machine using stub models — no real Kafka or LightGBM needed to
+  verify the logic) plus the full project test suite still passing.
+
+### Bugs found during live verification — six, across two full-month attempts
+
+A real performance saga, documented in full in DECISIONS.md:
+
+1. **Kafka producer `BufferError`** — missing periodic `poll(0)` during a
+   tight produce loop let librdkafka's local queue fill up.
+2. **Single-row `model.predict()` costs ~2.6ms purely from fixed per-call
+   overhead** (profiled: a 500-row batch costs the same ~2.6ms *total*).
+   Fixed by decoupling feature capture from model inference — the scorer
+   returns unscored requests, batched and predicted once at the end.
+3. **Building even a single-row pandas DataFrame costs ~2.4ms/call**, the
+   same order of overhead as #2 and the same root cause: pandas is built
+   for bulk operations, not thousands of tiny ones — a direct echo of
+   Milestone 2's rotation-building bug. Fixed by returning plain Python
+   dicts from the hot path (measured: ~0.0014ms/call, ~1700x faster) and
+   doing all DataFrame construction once, in bulk, at the end.
+4. **`.values` on a timezone-aware column silently strips the timezone**,
+   crashing the lead-time calculation with a tz-naive-vs-aware subtraction
+   error. Fixed by building results from the Series directly.
+5. **The real dominant cost at full-month scale**: cancelled flights
+   leaked into a "pending" dict with no event ever removing them,
+   scanned in full on every one of ~600K landed events. Fixed by indexing
+   pending flights by `(tail_number, fl_date)` and never adding cancelled
+   flights to it at all. Measured: full-month throughput went from 667
+   events/sec (timing out before finishing) to **14,338 events/sec**.
+6. **A partial, timed-out consume was reported as a final result** — the
+   first full-month run silently processed only 21.5% of events, then
+   printed "final" metrics against the full month's ground truth anyway,
+   making recall look catastrophically wrong in a way that read as a real
+   finding. Fixed by making an incomplete consume a hard error.
+
+### The headline result, with the caveat it needs
+
+**66.0% recall, 232-minute median lead time** for detecting a real
+15+-minute delay before scheduled departure, using the rotation-aware
+model — rising to **74.9% recall** for flights that have any inbound
+aircraft to track at all (vs. 5.9% for a tail's first leg of the day,
+where no rotation signal can possibly exist). The schedule-only model's
+nominal "1,440-minute lead time" is a simulation artifact (it only ever
+scores once, 24h ahead, by construction) masking just an 11.0% recall —
+reported deliberately alongside recall, not lead time alone, per the
+early-warning-evaluation research above.
+
+The MAE cross-check validates the whole harness against Milestone 3's
+offline numbers, using the identical trained models: schedule-only MAE
+29.82 (exact match to Milestone 3's 29.82), post-departure MAE 10.14
+(vs. 10.12), rotation MAE 22.09 (vs. 21.41 — a small, expected, and
+*more* correct divergence from this harness's stricter point-in-time
+discipline, not an error).
+
+### Progress notes
+
+- Final run (2026-10-10): 631,970 flights replayed as 1,859,448 events
+  through the real Redpanda stack, full month processed in 130 seconds
+  after the performance fixes (down from a first attempt that never
+  finished within a 600-second timeout).
+- Lint and all 40 unit tests (29 from Milestones 1-3 + 11 new) pass clean.
+- Deferred nothing in this milestone's own scope. Connection-risk
+  probability (precision/recall/calibration of `p_miss`) is explicitly
+  out of scope here — it needs a Trip/TripLeg entity with a minimum
+  connection time that doesn't exist yet (Milestones 8-9), a sequencing
+  dependency like Milestone 3's airport-condition features, not a
+  dropped requirement.

@@ -122,8 +122,12 @@ def run_target(features: pd.DataFrame, label: str, target: str, feature_cols, ru
     if run_ablation:
         with mlflow.start_run(run_name=f"{label}_schedule_only"):
             mlflow.log_params({"target": target, "features": SCHEDULE_FEATURES, **LGBM_PARAMS})
-            _, ablation_mae = fit_lightgbm(train, test, SCHEDULE_FEATURES, target)
+            ablation_model, ablation_mae = fit_lightgbm(train, test, SCHEDULE_FEATURES, target)
             mlflow.log_metric("mae", ablation_mae)
+            # Saved (not just scored) so Milestone 4's replay can score with
+            # the real schedule-only model for its lead-time comparison,
+            # rather than retraining a second copy of it.
+            mlflow.lightgbm.log_model(ablation_model, "model")
         result["schedule_only_mae"] = ablation_mae
 
     return result

@@ -68,7 +68,7 @@ def _local_dep_hour_dow_month(flights: pd.DataFrame, airport_tz_map: dict) -> pd
     )
 
 
-def _rotation_features(flights: pd.DataFrame) -> pd.DataFrame:
+def rotation_features(flights: pd.DataFrame) -> pd.DataFrame:
     sorted_flights = flights.sort_values(["tail_number", "fl_date", "sched_dep_utc"]).copy()
     # A column that happens to be all-NaT (e.g. scoring future flights for
     # pre-departure prediction -- none of them have landed yet) can lose its
@@ -135,7 +135,7 @@ def build_feature_table(flights: pd.DataFrame, airport_tz_map: dict) -> pd.DataF
     native missing-value handling, not filled with a misleading default.
     """
     time_feats = _local_dep_hour_dow_month(flights, airport_tz_map)
-    rotation_feats = _rotation_features(flights)
+    rotation_feats = rotation_features(flights)
 
     out = pd.concat(
         [

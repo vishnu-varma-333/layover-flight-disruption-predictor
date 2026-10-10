@@ -1,4 +1,4 @@
-.PHONY: up down logs verify lint test fetch-data build-data verify-data train-model
+.PHONY: up down logs verify lint test fetch-data build-data verify-data train-model backtest
 
 # LightGBM's macOS wheel needs the libomp OpenMP runtime, which it expects
 # at a Homebrew path this project deliberately doesn't use. scikit-learn's
@@ -35,3 +35,6 @@ verify-data:
 
 train-model:
 	DYLD_LIBRARY_PATH="$(LIBOMP_DIR)" .venv/bin/python scripts/train_model.py
+
+backtest:
+	DYLD_LIBRARY_PATH="$(LIBOMP_DIR)" .venv/bin/python scripts/run_backtest.py
