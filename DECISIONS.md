@@ -1519,3 +1519,125 @@ connection the dataset already contains.
 
 **No trip stopped being watched, no duplicate alert** -- the spec's own
 kill-test wording, demonstrated against a real crash, not simulated.
+
+## Milestone 9 — Web app
+
+### Architecture: Next.js as a thin client, a small internal Python API as the real backend
+
+The spec's tech choice is Next.js/TypeScript/PWA for the web app, but this
+project's actual business logic (trip creation, Temporal signals,
+TimescaleDB access, the real VAPID identity) is all Python, built and
+live-tested across Milestones 1-8. Rewriting any of it in TypeScript would
+be pure duplication risk for no benefit, so the web app is a genuine
+Next.js application, but every real operation happens through a new,
+small FastAPI service (`layover_web.api`) that the browser never talks to
+directly:
+
+- **Next.js Route Handlers are the only caller of `layover_web.api`**,
+  always server-side. The browser only ever talks to Next.js's own
+  origin. This sidesteps CORS entirely (no cross-origin cookies, no
+  credentialed-fetch complexity) and keeps `layover_web.api` an internal,
+  unauthenticated-but-trusted bridge -- it never needs to know about
+  sessions at all, only `user_id` values the Next.js layer already
+  verified.
+- **Next.js owns the user session**, not the Python API. A real,
+  lightweight sign-in (email identifies you, HMAC-signed cookie so it
+  can't be trivially forged client-side) rather than a fake "always
+  logged in as demo-user" skip -- but deliberately not OAuth or anything
+  requiring an external identity provider's credentials, which this
+  project doesn't have. The cookie does not verify email ownership (no
+  confirmation step); for a demo product with no sensitive data, that's
+  a named, reasonable scope boundary, not an oversight.
+- **Server Components fetch data directly** (`lib/backend.ts`, called
+  from `page.tsx` files); **Route Handlers exist for browser-initiated
+  mutations** (creating a trip, subscribing to push, stopping a trip) --
+  the same split most production Next.js apps use, not introduced for
+  this project specifically.
+
+### Aircraft chain view: the Milestone 2 dataset, not a new data source
+
+The spec's "Trip timeline: a live view of the aircraft's chain of
+flights and where delays are building" is answered directly from the
+historical Parquet every other milestone's "live" demo already replays
+from: given a flight, find its tail number and date, then every other
+flight that same tail flies that day, in schedule order. No new data
+source, no new ingestion -- the rotation information Milestone 2 already
+built (and Milestones 3, 4, 6 already use for the prediction itself) is
+exactly what this view needs to show.
+
+### "Add a trip by flight number and date" searches the real dataset, not a live schedule source
+
+There's no live flight-schedule API among this project's data sources (a
+real product would need a GDS integration, which is out of scope here,
+same reasoning as every other "no external account available" boundary
+in this project). Searching the Milestone 2 historical Parquet by
+carrier/flight-number/date is the honest, buildable equivalent for a
+demo scoped to a specific replayed day (2026-07-15, named directly in
+the UI) -- not a live production capability being misrepresented as one.
+
+### Two real bugs found building and live-testing the web app
+
+1. **A carrier+flight_number+date is not always unique.** Searching for
+   UA539 on 2026-07-15 silently returned the wrong half of this
+   project's own demo connection: BTS data genuinely reuses a flight
+   number across two different legs the same day (ORD->DFW, then
+   separately DFW->IAH) -- a real through-flight/equipment-swap pattern,
+   not a data error. `search_flight` originally returned `.iloc[0]`, the
+   first match in file order, with no way for a caller to know which
+   half of a real connection it actually got. Found by searching for the
+   project's own known demo flight and getting the wrong leg back,
+   confirmed by comparing against the known-correct `flight_id` directly.
+   Fixed by returning every match and having the UI show all of them
+   (exactly the way a real airline search handles a flight number that
+   covers more than one segment), with a regression test
+   (`test_search_returns_every_leg_when_a_flight_number_covers_more_than_one`)
+   locking in the fix.
+2. **`navigator.serviceWorker.ready` hangs forever if Service Worker
+   registration itself fails**, rather than rejecting. The original push-
+   subscribe flow relied on a background registration call (in the root
+   layout) and then awaited `.ready` in the subscribe button -- when
+   registration fails (confirmed in Milestone 8: this session's own
+   sandboxed browser tool disables Service Workers at the engine level),
+   `.ready` never resolves because nothing ever becomes active, and the
+   button was stuck on "Enabling..." indefinitely instead of failing
+   gracefully. Found live, clicking the button in the real running app,
+   not assumed from reading the code. Fixed by registering explicitly
+   inside the subscribe flow itself, so a real registration failure
+   surfaces as a caught, handled error ("Couldn't enable push
+   notifications. Email alerts will still be sent.") instead of an
+   invisible hang.
+
+### Live verification (real browser, real backend stack, 2026-10-11)
+
+Through this session's own browser tool against the full real stack
+(Temporal, TimescaleDB, Redis, the Milestone 7 prediction service, the
+new `layover_web.api`, and `next build`'s production build, which
+compiles clean with every route correctly inferred as dynamic -- nothing
+here is static/cacheable data, and nothing was force-prerendered into
+looking like it is):
+
+- Signed in, created a real trip (UA539 ORD->DFW connecting to AA1402
+  DFW->AUS, the same real tight connection Milestone 8's kill test used),
+  and watched the trip detail page render a real `p_miss = 99%` "High
+  risk" badge, a real `+109 min` predicted delay, the real evidence-
+  backed explanation, and the real aircraft-chain view (N76502's full
+  day: ORD->DFW->SFO->SAN->IAH) -- all sourced live from the same
+  pipeline Milestones 6-8 already built and verified, not new mock data.
+- Confirmed the public `/flights/[id]` page renders the same real risk
+  and chain data with no sign-in required.
+- Confirmed the push-subscribe button fails gracefully (not silently,
+  not by hanging) in this session's Service-Worker-disabled browser
+  environment, and that email alerts remain the working channel either
+  way.
+
+### Progress notes
+
+- `npx tsc --noEmit` and `npm run lint` both clean; `npm run build`
+  succeeds (production build, not just dev mode).
+- Lint and all 95 Python unit tests (90 from Milestones 1-8 + 5 new, all
+  for the flight-search/aircraft-chain logic) pass clean.
+- Deferred nothing buildable in this milestone's own scope. OAuth/real
+  identity verification is a named, deliberate scope boundary (no
+  external provider credentials available, and not required by the
+  spec's own data model, which only needs a `user_id` string) -- not a
+  dropped requirement.

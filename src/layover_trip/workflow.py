@@ -70,10 +70,25 @@ class TripMonitorWorkflow:
         self._latest: dict = {}
         self._last_alerted_p_miss: dict = {}
         self._alert_count: dict = {}
+        self._push_subscription: dict = {}
 
     @workflow.signal
     def stop_watching(self) -> None:
         self._stopped = True
+
+    @workflow.signal
+    def update_push_subscription(self, subscription: dict) -> None:
+        """Milestone 9: a trip's monitoring workflow is usually already
+        running by the time its owner opens the web app and grants
+        notification permission (the workflow starts the moment a trip is
+        added; subscribing is a later, separate user action) -- a signal,
+        not a fresh start parameter, is how a long-running workflow learns
+        about something that happens after it's already underway. The
+        subscription is also persisted to `trips.push_subscription` by the
+        API layer that sends this signal, so a *future* trip (or a worker
+        that's re-reading this trip from scratch) picks it up without
+        needing a repeat signal."""
+        self._push_subscription = subscription
 
     @workflow.query
     def get_latest_assessments(self) -> dict:
@@ -89,6 +104,7 @@ class TripMonitorWorkflow:
 
     @workflow.run
     async def run(self, inp: TripMonitorInput) -> None:
+        self._push_subscription = inp.push_subscription
         interval = timedelta(seconds=inp.check_interval_seconds)
         while not self._stopped:
             for leg in inp.legs:
@@ -161,7 +177,7 @@ class TripMonitorWorkflow:
                 trip_id=inp.trip_id,
                 dedup_key=dedup_key,
                 to_email=inp.to_email,
-                push_subscription=inp.push_subscription,
+                push_subscription=self._push_subscription,
                 subject="Your connection may be at risk",
                 body=_alert_message(leg, result),
             ),

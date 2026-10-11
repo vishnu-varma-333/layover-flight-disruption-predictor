@@ -21,7 +21,7 @@ planned).
       from online features.
 - [x] **8. Trip monitoring and alerts** — Temporal workflows, deduplicated
       push and email alerts, kill tests.
-- [ ] **9. Web app** — Trips, live risk, aircraft chain view,
+- [x] **9. Web app** — Trips, live risk, aircraft chain view,
       notifications.
 - [ ] **10. Ship it** — AWS deploy, load and replay reports, model card,
       demo video, write-up.
@@ -830,3 +830,78 @@ gap, not a silent one — full writeup in DECISIONS.md.
   logic itself. Full Web Push browser verification is a sequencing
   dependency on Milestone 9's subscribe UI, exactly like Milestone 4's
   TripLeg gap and Milestone 7's `p_miss` gap before it.
+
+## Milestone 9 — Web app
+
+**Goal:** a real Next.js PWA — add a trip by flight number and date, see
+each leg's live risk and explanation, watch the aircraft's chain of
+flights for the day, enable push notifications, and share a public
+flight page — backed entirely by the real Temporal workflow and
+prediction service already built, not a mock UI.
+
+### What was built
+
+- A small internal FastAPI service, `layover_web.api`, is the real
+  backend the web app talks to server-side only (never from the
+  browser) — reusing every real piece already built: Temporal
+  (starting/signaling trip monitors), TimescaleDB (trip/risk
+  persistence), the real VAPID identity (Web Push), and the Milestone 2
+  dataset (flight lookup and the aircraft-chain view). See DECISIONS.md
+  for why this split, not a TypeScript rewrite of the backend logic.
+- `src/layover_trip/trip_service.py` — trip-creation logic factored out
+  of Milestone 8's demo script so both it and the new web API share one
+  implementation of "what does adding a trip actually do."
+- A real, lightweight sign-in (email, HMAC-signed cookie — no OAuth, no
+  external identity provider credentials available) that Next.js owns
+  directly, not the Python API.
+- Pages: sign-in/trip list, add-a-trip (flight search with real
+  disambiguation when a flight number covers more than one leg), trip
+  detail (live risk, explanation, aircraft chain, push-subscribe,
+  stop-monitoring), and a public, no-auth flight status page.
+- A real PWA: manifest, installable icons, and a service worker that
+  handles genuine Web Push events (not a cache-the-app-shell worker —
+  this is a live-data app, so there's deliberately no offline caching
+  that could show stale risk data as current).
+- 5 new Python unit tests for flight search and the aircraft-chain
+  lookup (pure logic against synthetic data, same pattern as every other
+  milestone's pure-logic tests).
+
+### Two real bugs found building and live-testing this (both fixed)
+
+1. A carrier+flight_number+date is not always unique — UA539 on
+   2026-07-15 is genuinely two different legs under the same flight
+   number (a real through-flight/equipment-swap pattern in the BTS
+   data). The original search silently returned the wrong half of this
+   project's own demo connection; fixed by returning every match and
+   letting the UI disambiguate, the way a real airline search would.
+2. `navigator.serviceWorker.ready` hangs forever (not rejects) if
+   Service Worker registration itself fails — found live, clicking the
+   real push-subscribe button in the real running app, which hung on
+   "Enabling..." indefinitely in this session's Service-Worker-disabled
+   browser environment instead of failing visibly. Fixed by registering
+   explicitly inside the subscribe flow so a real failure is caught and
+   shown, not silently stuck.
+
+Full root-cause writeups for both in DECISIONS.md.
+
+### Live verification (real browser, real backend stack, 2026-10-11)
+
+Signed in, created a real trip on the same tight UA539→AA1402 connection
+Milestone 8's kill test used, and watched the trip detail page render a
+real 99% "High risk" badge, a real +109 min predicted delay, the real
+evidence-backed explanation, and the real aircraft-chain view — all
+sourced live from the pipeline Milestones 6-8 already built, not mock
+data. Confirmed the public flight page renders the same data with no
+sign-in required, and that the push-subscribe button degrades gracefully
+(not silently, not by hanging) with email alerts still working either
+way. `npx tsc --noEmit`, `npm run lint`, and `npm run build` (a real
+production build, not just dev mode) all pass clean.
+
+### Progress notes
+
+- Lint and all 95 Python unit tests (90 from Milestones 1–8 + 5 new) pass
+  clean.
+- Deferred nothing buildable in this milestone's own scope. OAuth/real
+  identity verification is a named, deliberate scope boundary (no
+  external provider credentials available, and the spec's own data model
+  only needs a `user_id` string) — not a dropped requirement.

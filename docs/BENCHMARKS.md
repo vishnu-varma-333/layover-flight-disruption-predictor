@@ -493,3 +493,49 @@ body delivered over a real HTTP connection — the full client-side Web
 Push protocol, genuinely exercised. Only the final "a real browser
 receives and displays it" hop is unverified, pending Milestone 9's
 subscribe UI.
+
+## Milestone 9 — Web app
+
+### Setup
+
+`next build` (production build) + the real running stack (Temporal,
+TimescaleDB, Redis, the Milestone 7 prediction service,
+`layover_web.api`), 2026-10-11, driven through this session's own
+browser tool against `localhost:3001` — a real browser, not a test
+harness mock.
+
+### Build and type-check
+
+| Check | Result |
+| --- | --- |
+| `npx tsc --noEmit` | clean |
+| `npm run lint` | clean |
+| `npm run build` | succeeds; every route correctly inferred as dynamic (no route force-prerendered into looking static when it reads live, per-request data) |
+
+### Server-rendering latency (dev mode, 3 real requests, public flight page)
+
+| Request | Time |
+| --- | --- |
+| 1 | 1.16s |
+| 2 | 0.76s |
+| 3 | 0.90s |
+
+Measured with `curl -w %{time_total}` against the Next.js **dev** server
+(Turbopack, unoptimized, no production caching) — each request does a
+real Server Component render that calls `layover_web.api`, which itself
+makes a real HTTP call to the Milestone 7 prediction service for that
+flight's risk. Reported as a dev-mode number, not a production one; a
+`next start` production run would be faster but wasn't separately
+benchmarked for this milestone.
+
+### Live end-to-end verification
+
+Created a real trip on the same tight UA539→AA1402 connection Milestone
+8's kill test used. Real results rendered in the actual browser: `p_miss
+= 99%`, predicted arrival delay `+109 min`, the real evidence-backed
+explanation, and the real aircraft-chain view (N76502's full day: ORD→
+DFW→SFO→SAN→IAH). The public `/flights/[id]` page rendered the same data
+with no sign-in required. The push-subscribe button failed visibly and
+gracefully in this session's Service-Worker-disabled browser environment
+(a real bug found and fixed live — see DECISIONS.md) rather than hanging
+silently.

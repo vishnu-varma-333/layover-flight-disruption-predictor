@@ -1,4 +1,4 @@
-.PHONY: up down logs verify lint test fetch-data build-data verify-data train-model backtest live-ingest verify-live rotation-produce rotation-job rotation-verify sync-features predict-service verify-predict trip-schema trip-worker trip-start verify-trip-monitoring
+.PHONY: up down logs verify lint test fetch-data build-data verify-data train-model backtest live-ingest verify-live rotation-produce rotation-job rotation-verify sync-features predict-service verify-predict trip-schema trip-worker trip-start verify-trip-monitoring web-api web
 
 # LightGBM's macOS wheel needs the libomp OpenMP runtime, which it expects
 # at a Homebrew path this project deliberately doesn't use. scikit-learn's
@@ -81,3 +81,9 @@ trip-start:
 
 verify-trip-monitoring:
 	.venv/bin/python scripts/verify_trip_monitoring.py
+
+web-api:
+	.venv/bin/python -m uvicorn layover_web.api:app --app-dir src --port 8001
+
+web:
+	cd web && npm run dev -- --port 3001

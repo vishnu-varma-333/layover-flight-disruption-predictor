@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS trips (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
+    to_email TEXT,
+    push_subscription JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -65,16 +67,23 @@ def apply_schema(conn) -> None:
     with conn, conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb")
         cur.execute(SCHEMA_SQL)
+        # `trips` already existed in deployed databases before Milestone 9
+        # added these two columns -- `CREATE TABLE IF NOT EXISTS` alone
+        # wouldn't retrofit them onto an existing table, so migrate
+        # explicitly (idempotent, safe to run against a fresh database too).
+        cur.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS to_email TEXT")
+        cur.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS push_subscription JSONB")
 
 
-def create_trip(conn, trip_id: str, user_id: str, legs: list) -> None:
+def create_trip(conn, trip_id: str, user_id: str, to_email: str, legs: list) -> None:
     """`legs`: ordered list of {"flight_id", "min_connection_min"} dicts --
     `leg_order` is each one's position in this list, not a caller-supplied
     field, so it's always a dense 0..n-1 sequence matching the trip's real
     leg order."""
     with conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO trips (id, user_id, status) VALUES (%s, %s, 'active')", (trip_id, user_id)
+            "INSERT INTO trips (id, user_id, status, to_email) VALUES (%s, %s, 'active', %s)",
+            (trip_id, user_id, to_email),
         )
         psycopg2.extras.execute_batch(
             cur,
@@ -84,6 +93,34 @@ def create_trip(conn, trip_id: str, user_id: str, legs: list) -> None:
                 (f"{trip_id}-leg{i}", trip_id, leg["flight_id"], i, leg.get("min_connection_min"))
                 for i, leg in enumerate(legs)
             ],
+        )
+
+
+def list_trips(conn, user_id: str) -> list:
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, status, created_at FROM trips WHERE user_id = %s ORDER BY created_at DESC",
+            (user_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def get_trip(conn, trip_id: str):
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, user_id, status, to_email, push_subscription, created_at "
+            "FROM trips WHERE id = %s",
+            (trip_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def update_push_subscription(conn, trip_id: str, subscription: dict) -> None:
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE trips SET push_subscription = %s WHERE id = %s",
+            (json.dumps(subscription), trip_id),
         )
 
 
