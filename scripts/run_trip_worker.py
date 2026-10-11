@@ -11,6 +11,7 @@ being watched, no duplicate alert") -- see
 """
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -29,7 +30,10 @@ TASK_QUEUE = "trip-monitoring"
 
 
 async def main():
-    client = await Client.connect("localhost:7233", namespace="default")
+    # Overridable so the same image runs in a container, where Temporal
+    # is a service name, not localhost -- see DECISIONS.md (Milestone 10).
+    temporal_address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    client = await Client.connect(temporal_address, namespace="default")
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,

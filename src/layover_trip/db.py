@@ -10,12 +10,21 @@ assessment"). `trips`/`trip_legs`/`alerts` are plain relational tables:
 low volume, keyed lookups, no time-series access pattern.
 """
 import json
+import os
 
 import psycopg2
 import psycopg2.extras
 
+# Defaults match infra/docker-compose.yml's local dev stack. Overridable
+# by env var so the same code runs inside a container, where "the
+# database" is a service name (e.g. "timescaledb"), not localhost --
+# see infra/docker-compose.prod.yml and DECISIONS.md (Milestone 10).
 CONNECTION_KWARGS = dict(
-    host="localhost", port=5432, user="layover", password="layover", dbname="layover"
+    host=os.environ.get("DB_HOST", "localhost"),
+    port=int(os.environ.get("DB_PORT", "5432")),
+    user=os.environ.get("DB_USER", "layover"),
+    password=os.environ.get("DB_PASSWORD", "layover"),
+    dbname=os.environ.get("DB_NAME", "layover"),
 )
 
 SCHEMA_SQL = """
@@ -122,6 +131,19 @@ def update_push_subscription(conn, trip_id: str, subscription: dict) -> None:
             "UPDATE trips SET push_subscription = %s WHERE id = %s",
             (json.dumps(subscription), trip_id),
         )
+
+
+def delete_trip(conn, trip_id: str) -> bool:
+    """A real, hard delete -- `trip_legs`, `alerts` and (transitively via
+    `trip_legs`) `risk_assessments` all reference `trips` with
+    `ON DELETE CASCADE`, so deleting the one row is a genuine "deletion
+    on request" for a user's personal trip data, not a soft-delete flag
+    that still leaves everything on disk. Returns False if the trip
+    didn't exist (caller 404s), True once it's gone.
+    """
+    with conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM trips WHERE id = %s", (trip_id,))
+        return cur.rowcount > 0
 
 
 def get_trip_legs(conn, trip_id: str) -> list:

@@ -1641,3 +1641,176 @@ looking like it is):
   external provider credentials available, and not required by the
   spec's own data model, which only needs a `user_id` string) -- not a
   dropped requirement.
+
+## Milestone 10 -- Ship it
+
+### AWS: Terraform written and validated, not applied
+
+No AWS account exists in this environment to apply against, and real
+cloud spend/credentials is exactly the kind of external blocker this
+project's own working agreement says to stop and ask about rather than
+fake. Decided, with the user: write complete Terraform (EC2, S3,
+Secrets Manager, least-privilege IAM), run `terraform validate` and
+`terraform fmt` against it (both clean -- see `infra/terraform/`), and
+honestly label it "written and validated, not deployed" everywhere it's
+referenced (README, WRITEUP.md, the model card) rather than imply a live
+AWS deployment exists. Same discipline every benchmark in this project
+already follows (dev-mode numbers labeled as dev-mode, not claimed as
+production).
+
+### One EC2 host with self-hosted TimescaleDB, not RDS + EKS
+
+The spec's tech-stack table lists "EC2 or EKS, RDS, S3" as options. Two
+real constraints decided this, not just cost:
+
+- **RDS for PostgreSQL does not support the TimescaleDB extension** --
+  confirmed against AWS's own supported-extensions list, not assumed.
+  Self-hosting Postgres+TimescaleDB in a container (exactly what
+  `infra/docker-compose.yml` already does locally) is the only way to
+  keep the hypertable this project actually uses for `positions` and
+  `risk_assessments`.
+- The spec's own "Cost note" (`docs/MILESTONES.md`'s source spec):
+  "Run Kafka, Flink and Temporal on one modest VM... for the demo; scale
+  out only for load tests." One EC2 instance running every service as a
+  container, rather than EKS's control-plane overhead for a single-node
+  workload, matches that guidance directly.
+
+S3 is still used -- for the trained MLflow model and processed Parquet
+data a real deployment would pull at boot, not for a database.
+
+### Containers for every *always-on* service; bounded jobs stay bounded
+
+"Containers for every service" (the spec's own production-readiness
+requirement) doesn't mean wiring `scripts/run_backtest.py` or the
+PyFlink rotation job as an always-on `docker compose up -d` service --
+both are bounded, point-in-time jobs by design (this project's whole
+replay architecture already treats "bounded, re-run on demand" as
+correct, not a demo shortcut; see Milestone 6's own `--bounded` flag and
+Milestone 4's backtest harness). Containerizing them as long-running
+services would just make them look crashed the instant they finish.
+Built instead: one shared image (`Dockerfile`) for every always-on
+Python service (prediction service, internal web API, Temporal trip
+worker) *and* the bounded scripts, differentiated by `command:` in
+`infra/docker-compose.prod.yml` -- and a separate `web/Dockerfile` for
+the Next.js app. The one-image-many-commands choice trades per-service
+image leanness (every service's image carries `apache-flink`, even the
+ones that never touch it) for not maintaining three near-identical
+Dockerfiles; the right call at this project's single-VM scale, not
+necessarily at a scale where image size/cold-start actually matters --
+noted as a real tradeoff, not a free lunch.
+
+### Hardcoded `localhost` -> env-var-configurable, for real container networking
+
+Every backend service (`layover_trip/db.py`, `layover_predict/
+service.py`, `layover_web/api.py`, `layover_trip/activities.py`,
+`scripts/run_trip_worker.py`) had its dependencies' addresses (Postgres,
+Redis, the prediction service, Temporal) hardcoded to `localhost` --
+correct for every milestone through 9, where everything ran as bare
+processes on one host, but wrong the moment each service is its own
+container: `localhost` inside a container means that container, not its
+neighbor. Fixed with `os.environ.get("X_HOST", "localhost")`-style
+overrides everywhere, defaulting to the exact previous hardcoded value
+so local `make` development is completely unaffected, with
+`infra/docker-compose.prod.yml` supplying real service-name values
+(`timescaledb`, `redis`, `predict-service`, `temporal`) for the
+containerized path. A real Twelve-Factor-config fix, not a Docker-only
+patch: the same env vars would also let a real AWS deployment point at
+managed endpoints without another code change.
+
+### A real bug, found only by actually running the container: MLflow's absolute-path artifact URIs
+
+Building and running the predict-service container live (not just
+`docker build` succeeding) surfaced a genuine portability bug:
+`mlflow.lightgbm.load_model(f"runs:/{run_id}/model")` failed inside the
+container with `OSError: No such file or directory:
+'/Users/chanakya/layover-flight-disruption-predictor/mlruns/...'` --
+MLflow's local FileStore bakes the *absolute host path mlruns lived at
+when a run was logged* into that run's own `meta.yaml`, and resolves
+`runs:/...` URIs through that stored path, not through whatever tracking
+URI the current process just set. Training happened on the host
+(`/Users/.../layover-flight-disruption-predictor/mlruns/...`); the
+container has the same directory copied to `/app/mlruns` -- a different
+absolute path, so the stored URI 404s. Fixed in `layover_predict/
+service.py` by loading directly from the path implied by `REPO_ROOT`
+(correct in both environments) instead of asking MLflow's tracking store
+to resolve a `runs:/` URI through its stored (and here, stale) path. Not
+fixed in `scripts/run_backtest.py` or `scripts/
+evaluate_connection_risk.py` -- neither runs inside a container, so
+neither is actually broken; changing them anyway would be a drive-by
+edit outside this bug's actual blast radius.
+
+### Data deletion: a real gap against the spec's own privacy requirement, built now
+
+The spec's "Production readiness" section requires "minimal retention
+after trips end, deletion on request" for v1 -- genuinely missing
+through Milestone 9, not merely unexercised. Built: `db.delete_trip()`
+(a real hard delete of the `trips` row; `trip_legs`, `alerts` and, via
+`trip_legs`, `risk_assessments` all already had `ON DELETE CASCADE`
+foreign keys from Milestone 8, so this is a complete deletion, not a
+partial one needing follow-up cleanup code), a `DELETE /trips/{id}`
+endpoint that also signals the workflow to stop watching first, and a
+confirm-before-delete UI control. Live-verified: created a real trip,
+deleted it through the real running UI, and queried TimescaleDB directly
+to confirm zero rows remained in any of the three cascaded tables, not
+just that the UI stopped showing it.
+
+While adding this, noticed (but did not fix, to keep this change
+scoped) that the existing `stop`/`push-subscription` Next.js routes
+skip the ownership check the trip-detail `GET` route already has --
+flagged as a follow-up task rather than silently left for someone to
+find later.
+
+### Connection-risk precision/recall/calibration: measured for the first time, on synthetic connections
+
+The spec's "Metrics and benchmarks" table asks for "precision, recall
+and calibration of `p_miss`... with a calibration plot" -- not measured
+by any earlier milestone (Milestone 4 measures single-flight delay
+detection; Milestone 8 measures only the residual quantiles `p_miss` is
+built from, not how well the resulting probability tracks real
+outcomes). Built `scripts/evaluate_connection_risk.py`: BTS has no
+passenger itinerary data, so there's no real "did this traveler make
+their connection" label to evaluate against -- connections are
+synthetically constructed from every real flight pair at a Milestone 5
+hub airport, same day, 20-180 minutes apart by schedule. A genuine
+limitation (documented in `docs/MODEL_CARD.md`), not a shortcut: no
+booking data exists to build the real evaluation from.
+
+First version of this script did a full per-(airport, day) cross-join
+and didn't finish in 5+ minutes even on the connection-count end of
+things it was trying to compute -- a busy hub's day has ~800-900
+flights, so arrivals x departures for just ATL across 31 days alone is
+tens of millions of candidate pairs before any filtering. Rewritten to
+use a sorted-array `searchsorted` window lookup per (airport, day) group
+(cost proportional to connections actually in the 20-180 minute window,
+not every possible pair) -- finished in under 3 minutes. Result:
+67.7% precision / 72.5% recall at the production `p_miss >= 0.30` alert
+threshold, and a calibration curve close to the diagonal through the
+middle deciles, slightly over-confident at the extremes (see
+`docs/MODEL_CARD.md` for the full table and the calibration plot).
+
+### Load test: reused the real Milestone 4 backtest harness, re-run fresh
+
+The spec's load-test bar is "replay historical days at 10x to 100x
+speed." Rather than build a separate synthetic load generator, re-ran
+the exact same real backtest harness Milestone 4 already built (same
+Kafka transport, same point-in-time-correct scoring) against the same
+July 2026 month, timed end to end: 18,504 events/sec sustained,
+full-month replay (31 real days) in ~128 seconds wall-clock -- roughly
+20,900x real time, well past the spec's target. Using the same harness
+rather than a new one means this number is honest about what's actually
+being measured (the real serving path's throughput), not a best-case
+number from a stripped-down benchmark harness that skips the real
+feature-capture and scoring work.
+
+### A real incident, mid-milestone: killed the host's Docker daemon
+
+While testing the new containers, freeing TCP port 3001 (`lsof -ti:3001
+| xargs kill`) killed Docker Desktop's own process instead of the
+intended stale dev-server process, stopping every running container on
+the machine. Full timeline, root cause and recovery: `docs/
+POSTMORTEM.md`. No durable data was lost (TimescaleDB has a real volume;
+Redis/Kafka deliberately don't -- see that document's "why this didn't
+lose real data" section), but it's real, it happened during this
+project's own work, and it's documented rather than quietly worked
+around -- consistent with how every other bug in this project got
+handled.

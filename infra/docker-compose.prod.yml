@@ -1,0 +1,94 @@
+# Milestone 10: containers for the services that were, through Milestones
+# 7-9, only ever run as bare `.venv`/`npm` processes on the host via
+# `make predict-service` / `make web-api` / `make trip-worker` / `make
+# web`. infra/docker-compose.yml (Milestone 1) already containers the
+# infrastructure (Kafka, TimescaleDB, Redis, Temporal, observability);
+# this file adds the application layer alongside it, matching the spec's
+# "containers for every service" production-readiness requirement. Run
+# together, not standalone -- the app services resolve the infra
+# services by the service names below, which only resolve on the
+# network `docker compose` creates when both files are part of the same
+# invocation:
+#
+#   docker compose -f infra/docker-compose.yml -f infra/docker-compose.prod.yml up -d
+#
+# What's deliberately NOT an always-on service here: the data/training
+# pipeline (fetch-data, build-data, train-model), the backtest/replay
+# harness, the live ingestors, and the PyFlink rotation-linking job are
+# all bounded, point-in-time jobs by design (see DECISIONS.md and the
+# spec's own "replay historical days" framing) -- wiring them as
+# `docker compose up -d` services would just make them look crashed the
+# moment they finish. They run the same way in production as they do in
+# this repo's own Makefile: invoked (by a human, or a scheduler like
+# cron/EventBridge) against this same image, e.g.
+# `docker run layover-app python scripts/run_backtest.py`.
+services:
+  predict-service:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: layover-predict-service
+    command: uvicorn layover_predict.service:app --app-dir src --host 0.0.0.0 --port 8000
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  web-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: layover-web-api
+    command: uvicorn layover_web.api:app --app-dir src --host 0.0.0.0 --port 8001
+    environment:
+      DB_HOST: timescaledb
+      DB_PASSWORD: ${DB_PASSWORD:-layover}
+      PREDICTION_SERVICE_URL: http://predict-service:8000
+      TEMPORAL_ADDRESS: temporal:7233
+      # Set to the real public origin (e.g. https://app.layover.example)
+      # in an actual deployment -- see infra/terraform's TODO on wiring
+      # Terraform outputs into these env vars.
+      WEB_ORIGIN: http://localhost:3001
+    ports:
+      - "8001:8001"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      predict-service:
+        condition: service_started
+
+  trip-worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: layover-trip-worker
+    command: python scripts/run_trip_worker.py
+    environment:
+      DB_HOST: timescaledb
+      DB_PASSWORD: ${DB_PASSWORD:-layover}
+      PREDICTION_SERVICE_URL: http://predict-service:8000
+      TEMPORAL_ADDRESS: temporal:7233
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      predict-service:
+        condition: service_started
+
+  web:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+    container_name: layover-web
+    environment:
+      BACKEND_URL: http://web-api:8001
+      # A real deployment pulls this from AWS Secrets Manager (see
+      # infra/terraform) rather than setting it here in plain text.
+      SESSION_SECRET: ${SESSION_SECRET:-layover-dev-secret-not-for-production}
+    ports:
+      - "3001:3001"
+    depends_on:
+      - web-api

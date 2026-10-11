@@ -539,3 +539,69 @@ with no sign-in required. The push-subscribe button failed visibly and
 gracefully in this session's Service-Worker-disabled browser environment
 (a real bug found and fixed live — see DECISIONS.md) rather than hanging
 silently.
+
+## Milestone 10 — Ship it
+
+### Load test / replay speed (fresh run, 2026-10-11, `make backtest`)
+
+Same real July 2026 holdout month and Kafka pipeline as Milestone 4's
+own backtest, re-run fresh for this milestone's load-test report (not
+reused from the original Milestone 4 numbers, which were themselves
+re-measured once already after a Milestone 7 fix — see that section).
+
+| Stage | Result |
+| --- | --- |
+| Event stream construction | 1,859,448 events in 1.1s |
+| Kafka produce | 1,859,448 events in 27.5s |
+| Consume + score | 1,859,448 events in 100.5s (**18,504 events/sec**) |
+| Full month wall-clock (produce + consume/score) | ~128s |
+| Real month span replayed | 31 days = 2,678,400s |
+| **Effective speedup** | **~20,900x real time** (spec's target: 10-100x) |
+
+Accuracy numbers from this same fresh run (consistent with Milestone
+4's, confirming determinism): rotation model 64.9% recall (15+ min
+delay), 219.0 min median lead time; schedule-only 11.0% recall.
+
+### Connection-risk evaluation (`scripts/evaluate_connection_risk.py`)
+
+**Before/after the join-strategy fix:** a first version using a full
+per-(airport, day) cross-join hadn't finished after 5+ minutes (killed
+rather than let run further) — a busy hub's day has ~800-900 flights,
+so even one hub's month of arrivals × departures is tens of millions of
+candidate pairs before any filtering. Rewritten to a sorted-array
+`searchsorted` window lookup per (airport, day) group: **full run in
+2m36s** (model load + inference: ~1.5 min of that; connection
+construction + evaluation: ~1 min).
+
+| Metric | Value |
+| --- | --- |
+| Synthetic connections evaluated | 23,541,240 (15 hub airports, July 2026, 20-180 min schedule gap) |
+| Base rate (connection actually missed) | 20.63% |
+| Precision @ `p_miss >= 0.30` (the real production alert threshold) | 67.7% |
+| Recall @ `p_miss >= 0.30` | 72.5% |
+
+Calibration (predicted vs. observed miss rate, decile bins) — full
+table and plot in `docs/MODEL_CARD.md`; close to the diagonal through
+the middle deciles, predicted 94.3% vs. observed 90.7% in the top
+decile (slightly risk-averse at the extreme, the safer direction to be
+wrong in for a missed-connection warning).
+
+### Containerization (2026-10-11, real `docker build` + `docker compose up`)
+
+| Step | Result |
+| --- | --- |
+| Backend image build (`docker build --platform linux/amd64 .`) | succeeds; fails on native `linux/arm64` (`apache-flink` has no prebuilt arm64 Linux wheel — found live, not assumed; see DECISIONS.md) |
+| Web image build (`web/Dockerfile`, multi-stage, `output: standalone`) | succeeds; `next build` inside the image compiles clean, same route inference as Milestone 9's bare-process build |
+| All 4 app containers + existing infra stack, `docker compose up -d` | all started; `predict-service` and `web-api` both pass `/healthz` |
+| Cross-container call (web-api → predict-service) | real risk data returned (`predicted_delay: 108.8`, the same UA539 number every earlier milestone measured) — not a stub |
+| Real bug found only by running the container (not just building it) | MLflow `runs:/` URI resolution failed (absolute host path baked into run metadata) — fixed; see DECISIONS.md |
+| Live create + delete of a real trip, containerized stack, verified by direct TimescaleDB query | trip, its leg, and its cascade all confirmed gone (0 rows), not just hidden from the UI |
+
+### Terraform (`infra/terraform/`, not applied — see DECISIONS.md)
+
+| Check | Result |
+| --- | --- |
+| `terraform fmt -check` | 1 file reformatted, then clean |
+| `terraform init -backend=false` | succeeds (aws ~> 5.0, random ~> 3.6) |
+| `terraform validate` | clean |
+| `terraform plan` / `apply` | **not run** — no AWS account available in this environment |

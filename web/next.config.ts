@@ -8,6 +8,10 @@ const nextConfig: NextConfig = {
   // this is left off rather than adding Suspense boundaries purely to
   // satisfy a dev-overlay hint for an optimization this app can't use.
   agentRules: false,
+  // Milestone 10: a self-contained server bundle (just node + this
+  // output dir, no node_modules copy) for the production Docker image --
+  // see web/Dockerfile.
+  output: "standalone",
   turbopack: {
     rules: {
       "*.css": {

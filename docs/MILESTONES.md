@@ -23,7 +23,7 @@ planned).
       push and email alerts, kill tests.
 - [x] **9. Web app** — Trips, live risk, aircraft chain view,
       notifications.
-- [ ] **10. Ship it** — AWS deploy, load and replay reports, model card,
+- [x] **10. Ship it** — AWS deploy, load and replay reports, model card,
       demo video, write-up.
 - [ ] **11. Version 2** — Email import, whole-trip risk, airport-level
       disruption signals.
@@ -905,3 +905,94 @@ production build, not just dev mode) all pass clean.
   identity verification is a named, deliberate scope boundary (no
   external provider credentials available, and the spec's own data model
   only needs a `user_id` string) — not a dropped requirement.
+
+## Milestone 10 — Ship it
+
+**Goal:** AWS deploy (as code), load and replay reports, a model card,
+a demo video, a write-up — the spec's own "production readiness" bar
+made real: containers for every service, least-privilege IAM, real
+deletion on request, and every benchmark honestly labeled.
+
+### What was built
+
+- **Terraform for AWS** (`infra/terraform/`): one EC2 host running every
+  service as a container (matching the spec's own cost-conscious "one
+  modest VM" guidance), S3 for model/data artifacts, Secrets Manager for
+  the session secret and DB password (real random values, never
+  committed), least-privilege IAM (scoped to exactly one bucket and two
+  secrets, not account-wide access). `terraform validate` and
+  `terraform fmt` both clean. **Not applied** — no AWS account exists in
+  this environment; see DECISIONS.md for why that's a stop-and-ask
+  external blocker, not a shortcut.
+- **Containers for every always-on service**: a shared `Dockerfile` for
+  the prediction service, internal web API and Temporal trip worker
+  (differentiated by command), a separate `web/Dockerfile` for the
+  Next.js app (multi-stage, `output: "standalone"`), and
+  `infra/docker-compose.prod.yml` wiring them to the existing
+  Milestone 1 infra stack. Built and **live-tested together** — all four
+  containers started, signed in and created a trip through the
+  containerized web app, confirmed a cross-container HTTP call
+  (web-api → predict-service) returned real risk data.
+- **Portability fixes** this surfaced: every hardcoded `localhost` in
+  the backend (db, Redis, Temporal, the prediction service) became an
+  overridable env var (defaulting to the old hardcoded value, so local
+  `make` development is unaffected); a real MLflow bug where model
+  loading failed inside the container because MLflow bakes an absolute
+  host path into a run's own metadata.
+- **Connection-risk precision/recall/calibration**
+  (`scripts/evaluate_connection_risk.py`): measured for the first time —
+  67.7% precision / 72.5% recall at the production alert threshold, a
+  calibration plot, on 23.5M synthetic connections (no real booking data
+  exists to build a real evaluation from — documented as a limitation).
+- **Data deletion**: a real hard-delete endpoint and confirm-before-
+  delete UI control, closing a genuine gap against the spec's "deletion
+  on request" privacy requirement.
+- **Load and replay reports** (`docs/REPLAY_REPORT.md`): re-ran the real
+  Milestone 4 backtest harness fresh — 18,504 events/sec, a full month
+  of real data replayed ~20,900x faster than real time, far past the
+  spec's 10-100x target.
+- **Model card** (`docs/MODEL_CARD.md`), **runbook**
+  (`docs/RUNBOOK.md`), **postmortem** (`docs/POSTMORTEM.md`, for a real
+  incident hit during this milestone's own work), **demo script**
+  (`docs/DEMO_SCRIPT.md`), and **write-up** (`WRITEUP.md`).
+
+### A real incident, documented rather than quietly fixed
+
+Freeing a port during container testing killed the host's Docker daemon
+itself (not the intended process), stopping every running container.
+No durable data was lost (TimescaleDB has a real volume; Redis/Kafka
+deliberately don't). Full timeline and root cause in
+`docs/POSTMORTEM.md` — written the same way every other real bug in this
+project gets handled: documented, not hidden.
+
+### Live verification
+
+Built both Docker images (`docker build --platform linux/amd64`, the
+real EC2 deploy target — `apache-flink` has no prebuilt `linux/arm64`
+wheel, found live rather than assumed). Brought up all four app
+containers alongside the real infra stack (`docker compose -p layover
+-f infra/docker-compose.yml -f infra/docker-compose.prod.yml up -d`),
+confirmed `/healthz` on both Python services, confirmed a real
+cross-container flight-risk lookup returned actual model output (not a
+stub), and signed in + reached the trips page through the containerized
+Next.js app. Live-created and live-deleted a real trip through the
+production delete endpoint, confirming via a direct TimescaleDB query
+that the trip, its legs, and its risk-assessment history were all
+actually gone, not just hidden from the UI. `terraform validate` clean
+against the real (if unapplied) AWS provider.
+
+### Progress notes
+
+- Lint and all 95 Python unit tests still pass clean after every
+  env-var/portability change. `npx tsc --noEmit`, `npm run lint`, and
+  `npm run build` all clean after the new delete-trip route/component.
+- Deferred nothing buildable in this milestone's own scope. The one
+  genuine external blocker (a real AWS account to deploy against) was
+  surfaced to the user before any work started, not discovered partway
+  through and quietly worked around — the agreed resolution (write and
+  validate the Terraform, don't apply it) is reflected everywhere this
+  milestone is referenced, never silently upgraded to "deployed."
+- The demo video itself is a script (`docs/DEMO_SCRIPT.md`), not a
+  rendered file — recording needs real screen capture and voiceover,
+  which this environment can't produce; named honestly rather than
+  claimed as done.

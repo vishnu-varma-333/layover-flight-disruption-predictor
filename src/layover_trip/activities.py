@@ -6,6 +6,7 @@ gets replayed from history after a worker restart), and only Activities
 are allowed to do real-world I/O. See DECISIONS.md.
 """
 import dataclasses
+import os
 from typing import Optional
 
 import requests
@@ -13,7 +14,10 @@ from temporalio import activity
 
 from layover_trip import db, notify, risk
 
-PREDICTION_SERVICE_URL = "http://localhost:8000"
+# Overridable so the same image runs in a container, where the
+# prediction service is a service name, not localhost -- see
+# DECISIONS.md (Milestone 10).
+PREDICTION_SERVICE_URL = os.environ.get("PREDICTION_SERVICE_URL", "http://localhost:8000")
 DEFAULT_MIN_CONNECTION_MINUTES = 45
 
 

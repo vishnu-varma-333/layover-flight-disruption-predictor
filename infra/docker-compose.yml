@@ -32,7 +32,12 @@ services:
     container_name: layover-timescaledb
     environment:
       POSTGRES_USER: layover
-      POSTGRES_PASSWORD: layover
+      # Overridable (Milestone 10): local dev keeps the same password it
+      # always has; a real deploy sets DB_PASSWORD from the Secrets
+      # Manager value infra/terraform's user_data script fetches, so the
+      # same compose file works in both places without a prod-only fork
+      # of this service definition.
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-layover}
       POSTGRES_DB: layover
     ports:
       - "5432:5432"

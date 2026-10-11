@@ -8,6 +8,7 @@ persistence (Milestone 8), the real VAPID identity for Web Push
 and the aircraft-chain view.
 """
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -27,13 +28,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-PREDICTION_SERVICE_URL = "http://localhost:8000"
+# Overridable so the same image runs in a container, where these are
+# service names, not localhost -- see DECISIONS.md (Milestone 10).
+PREDICTION_SERVICE_URL = os.environ.get("PREDICTION_SERVICE_URL", "http://localhost:8000")
+TEMPORAL_ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+WEB_ORIGIN = os.environ.get("WEB_ORIGIN", "http://localhost:3001")
 state = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    state["temporal"] = await Client.connect("localhost:7233", namespace="default")
+    state["temporal"] = await Client.connect(TEMPORAL_ADDRESS, namespace="default")
     state["flights"] = load_flights_df(REPO_ROOT)
     conn = db.connect()
     db.apply_schema(conn)
@@ -50,7 +55,7 @@ app = FastAPI(title="Layover web API", lifespan=lifespan)
 # debugging) rather than left wide open.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3001"],
+    allow_origins=[WEB_ORIGIN],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -173,3 +178,21 @@ async def stop_trip(trip_id: str):
     handle = state["temporal"].get_workflow_handle(f"trip-monitor-{trip_id}")
     await handle.signal("stop_watching")
     return {"status": "ok"}
+
+
+@app.delete("/trips/{trip_id}")
+async def delete_trip(trip_id: str):
+    handle = state["temporal"].get_workflow_handle(f"trip-monitor-{trip_id}")
+    try:
+        await handle.signal("stop_watching")
+    except Exception as exc:  # noqa: BLE001 -- already stopped/completed is fine
+        logger.warning("could not signal workflow for %s before delete: %s", trip_id, exc)
+
+    conn = db.connect()
+    try:
+        existed = db.delete_trip(conn, trip_id)
+    finally:
+        conn.close()
+    if not existed:
+        raise HTTPException(status_code=404, detail="unknown trip")
+    return {"status": "deleted"}

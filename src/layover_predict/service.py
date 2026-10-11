@@ -15,6 +15,7 @@ requirement: the spec's own Build milestones list assigns connection
 risk and whole-trip risk to later work.
 """
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -32,8 +33,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
+# Overridable so the same image runs in a container, where Redis is a
+# service name, not localhost -- see DECISIONS.md (Milestone 10).
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 
 # Mirrors scripts/run_backtest.py's own run-name labels -- this service
 # serves the identical models the backtest already validated, not a
@@ -47,16 +50,32 @@ state = {}
 
 
 def _load_latest_model(client, run_name: str):
+    experiment_id = client.get_experiment_by_name("layover-delay-models").experiment_id
     runs = client.search_runs(
-        client.get_experiment_by_name("layover-delay-models").experiment_id,
+        experiment_id,
         filter_string=f"tags.mlflow.runName = '{run_name}'",
         order_by=["start_time DESC"],
         max_results=1,
     )
     if not runs:
         raise RuntimeError(f"no MLflow run found with name {run_name!r} -- run train_model.py")
-    model = mlflow.lightgbm.load_model(f"runs:/{runs[0].info.run_id}/model")
-    return model, runs[0].info.run_id
+    run_id = runs[0].info.run_id
+    # Not `mlflow.lightgbm.load_model(f"runs:/{run_id}/model")`: MLflow's
+    # local FileStore bakes the *absolute path mlruns lived at when the
+    # run was logged* into that run's own metadata (`artifact_uri` in its
+    # meta.yaml), and resolves "runs:/..." URIs through that stored path
+    # -- not through the tracking URI this process just set. Training
+    # happens on the host (`/Users/.../layover-flight-disruption-
+    # predictor/mlruns/...`); this service also runs inside a container
+    # with the same mlruns directory copied to `/app/mlruns` (see
+    # Dockerfile) -- a different absolute path, so the stored URI 404s.
+    # Found live running this service in Docker for Milestone 10, not
+    # assumed. Loading straight from the path implied by REPO_ROOT (which
+    # IS correct in both environments) sidesteps the stale stored path
+    # entirely. See DECISIONS.md.
+    model_path = REPO_ROOT / "mlruns" / experiment_id / run_id / "artifacts" / "model"
+    model = mlflow.lightgbm.load_model(str(model_path))
+    return model, run_id
 
 
 @asynccontextmanager

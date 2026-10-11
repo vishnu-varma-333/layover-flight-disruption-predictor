@@ -1,0 +1,47 @@
+#!/bin/bash
+# Milestone 10: boots a bare Ubuntu instance into a running Layover
+# stack. Not applied/run against real AWS in this environment (no AWS
+# account available here -- see DECISIONS.md) -- written and validated
+# with `terraform validate`, meant to be read and run for real once the
+# project actually ships to an AWS account.
+set -euxo pipefail
+
+apt-get update
+apt-get install -y ca-certificates curl gnupg git awscli
+
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+  > /etc/apt/sources.list.d/docker.list
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+systemctl enable --now docker
+
+git clone --depth 1 "${github_repo_url}" /opt/layover
+cd /opt/layover
+
+# Pulls the trained model + processed historical dataset this instance
+# serves. Prerequisite this script does NOT perform: someone running
+# `make train-model && make build-data` once, locally, and uploading the
+# result --
+#   aws s3 sync mlruns s3://${data_bucket}/mlruns
+#   aws s3 sync data/processed s3://${data_bucket}/data/processed
+# -- the same role-based access this instance's IAM role grants it to
+# read back. Training on the instance itself at boot was deliberately
+# ruled out: it would make "the demo is up" depend on a from-scratch
+# LightGBM training run finishing first, for no benefit over training
+# once and reusing the result, which is exactly how every other
+# artifact (processed Parquet, trained model) already flows through
+# this project -- built once, replayed/served many times.
+mkdir -p mlruns data/processed
+aws s3 sync "s3://${data_bucket}/mlruns" mlruns --region "${aws_region}"
+aws s3 sync "s3://${data_bucket}/data/processed" data/processed --region "${aws_region}"
+
+export SESSION_SECRET
+SESSION_SECRET=$(aws secretsmanager get-secret-value --secret-id "${session_secret_arn}" --region "${aws_region}" --query SecretString --output text)
+export DB_PASSWORD
+DB_PASSWORD=$(aws secretsmanager get-secret-value --secret-id "${db_password_arn}" --region "${aws_region}" --query SecretString --output text)
+
+docker compose -p layover -f infra/docker-compose.yml -f infra/docker-compose.prod.yml up -d --build

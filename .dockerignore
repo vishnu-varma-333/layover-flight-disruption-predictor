@@ -1,0 +1,11 @@
+.venv
+.git
+web
+data/raw
+!data/raw/reference
+infra
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+docs

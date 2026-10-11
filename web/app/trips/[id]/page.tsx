@@ -7,6 +7,7 @@ import { AircraftChain } from "@/components/AircraftChain";
 import { PushSubscribeButton } from "@/components/PushSubscribeButton";
 import { RiskBadge } from "@/components/RiskBadge";
 import { StopTripButton } from "@/components/StopTripButton";
+import { DeleteTripButton } from "@/components/DeleteTripButton";
 
 export default async function TripDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const userId = await getUserId();
@@ -45,7 +46,10 @@ export default async function TripDetailPage({ params }: { params: Promise<{ id:
           </h1>
           <p className="mt-1 text-sm capitalize text-zinc-500 dark:text-zinc-400">{trip.status}</p>
         </div>
-        {trip.status === "active" && <StopTripButton tripId={trip.id} />}
+        <div className="flex flex-col items-end gap-2">
+          {trip.status === "active" && <StopTripButton tripId={trip.id} />}
+          <DeleteTripButton tripId={trip.id} />
+        </div>
       </div>
 
       {trip.status === "active" && (
